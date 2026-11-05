@@ -776,18 +776,39 @@ class VoiceViewModel(_ViewmodelBase):
 
     @Property(list, notify=voiceProgramsChanged)
     def voicePrograms(self) -> List[QObject]:
+        from .. import voice_program_manager as _vpm
+
         options = list(getattr(self._controller, "voiceProgramOptions", []) or [])
         selected = int(getattr(self._controller, "selectedVoiceProgramIndex", -1))
-        rows = [
-            ChoiceRow(
-                id=str(index),
-                label=str(label),
-                detail="",
-                enabled=True,
-                selected=(index == selected),
+        # ``voiceProgramOptions`` is in the SELECTABLE order while
+        # ``selectedVoiceProgramIndex`` is in PROVIDER order (which still has
+        # the legacy "custom" slot). Comparing the two numerically marks the
+        # wrong row - and dispatching a row index selects the wrong provider.
+        # Translate through the provider id instead.
+        try:
+            selected_id = _vpm.provider_id_for_index(selected)
+        except Exception:
+            selected_id = None
+        rows = []
+        for index, label in enumerate(options):
+            provider_id = (
+                _vpm.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER[index]
+                if index < len(_vpm.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER)
+                else None
             )
-            for index, label in enumerate(options)
-        ]
+            rows.append(
+                ChoiceRow(
+                    id=str(index),
+                    label=str(label),
+                    detail="",
+                    enabled=True,
+                    selected=(
+                        provider_id is not None
+                        and provider_id == selected_id
+                        and selected_id != _vpm.VOICE_PROGRAM_CUSTOM
+                    ),
+                )
+            )
         return self._cached_views("voicePrograms", rows)
 
     @Property(str, notify=hotkeyLabelChanged)
@@ -857,13 +878,22 @@ class VoiceViewModel(_ViewmodelBase):
 
     @Slot(str)
     def setVoiceProgram(self, id: str) -> None:
+        from .. import voice_program_manager as _vpm
+
         try:
             index = int(id)
         except (TypeError, ValueError):
             return
         options = list(getattr(self._controller, "voiceProgramOptions", []) or [])
-        if 0 <= index < len(options):
-            self._controller.selectedVoiceProgramIndex = index
+        if not 0 <= index < len(options):
+            return
+        # Row indices are SELECTABLE-order; the setter takes PROVIDER-order.
+        # Dispatching the row index directly turns the last selectable row
+        # (Chatterfly) into the legacy "custom" slot and is silently rejected.
+        if index >= len(_vpm.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER):
+            return
+        provider_id = _vpm.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER[index]
+        self._controller.selectedVoiceProgramIndex = _vpm.provider_index(provider_id)
 
     @Slot(str)
     def setRecordingMode(self, mode: str) -> None:

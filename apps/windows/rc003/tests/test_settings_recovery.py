@@ -264,24 +264,84 @@ def engine_factory():
     engine = Engine(); engines.append(engine)
     engine.warnings.connect(lambda values: warnings.extend(str(value) for value in values))
     return engine
+from ovb_rc003.presentation import registry as presentation_registry
+held_viewmodels = {}
+real_register = presentation_registry.register
+def capture_register(*args, **kwargs):
+    held_viewmodels['set'] = real_register(*args, **kwargs)
+    return held_viewmodels['set']
+def class_items(root_item, class_part):
+    found, stack = [], [root_item]
+    while stack:
+        item = stack.pop(0)
+        if class_part in str(item.metaObject().className()):
+            found.append(item)
+        children = list(item.children())
+        child_items = getattr(item, 'childItems', None)
+        if callable(child_items):
+            children.extend(child for child in child_items() if child not in children)
+        stack.extend(children)
+    return found
 def verify():
     try:
         controller = controllers[0]
+        viewmodels = held_viewmodels['set']
         window = engines[0].rootObjects()[0]
-        warning = window.findChild(QObject, 'configurationWarning')
-        result['warning_visible'] = warning.property('visible')
+        maintenance = viewmodels.MaintenanceViewModel
         result['readonly'] = controller.configurationReadOnly
         result['visible'] = window.isVisible()
-        result['save_disabled'] = not window.findChild(QObject, 'launchBridgeOnAppStartSwitch').property('enabled')
-        result['select_disabled'] = not window.findChild(QObject, 'selectRemoteButton').property('enabled')
-        result['export_enabled'] = window.findChild(QObject, 'deviceOpenLogButton').property('enabled')
-        result['update_enabled'] = window.findChild(QObject, 'checkApplicationUpdateButton').property('enabled')
-        tabs = window.findChild(QObject, 'tabBar')
+        # The settings page owns every affordance checked below; open it the
+        # way the user must (the old shell's controls all lived on its default
+        # page and were visible from the start).
+        viewmodels.AppViewModel.currentPage = 2
+        app.processEvents()
+        # The retired configurationWarning banner rendered
+        # controller.configurationError whenever the settings were unreadable.
+        # The surviving report paths keep that exact text reachable: every
+        # preference toggle comes up disabled and the typed feedback seam
+        # (the message SettingsPanel renders on a refused toggle) carries it.
+        preferences = [row.contract for row in maintenance.preferences]
+        result['save_disabled'] = len(preferences) == 4 and all(
+            row.enabled is False for row in preferences)
+        verdict = maintenance.setPreference('auto_start_bridge', True)
+        result['config_error_reported'] = (
+            verdict.ok is False
+            and verdict.message == controller.configurationError
+            and bool(controller.configurationError))
+        # Unreadable settings never disable the diagnostic affordances.
+        result['update_enabled'] = bool(
+            window.findChild(QObject, 'settingsUpdateActionButton').property('enabled'))
+        # The 维护 section starts folded; unfold it the way the user must.
+        window.findChild(QObject, 'settingsMaintenanceSection').setProperty('folded', False)
+        app.processEvents()
+        items = {row.contract.id: row.contract for row in maintenance.items}
+        section = window.findChild(QObject, 'settingsMaintenanceSection')
+        logs_rows = [row for row in class_items(section, 'DiagnosticResultRow')
+                     if row.property('titleText') == items['logs'].title]
+        logs_button = class_items(logs_rows[0].parent(), 'CompactButton')[0]
+        result['export_enabled'] = (
+            bool(logs_button.property('enabled'))
+            and bool(logs_button.property('visible')))
+        # The log export completes even though the configuration is unreadable.
+        default_export = classes['QUrl'](controller.logExportDefaultFile()).toLocalFile()
+        maintenance.run('logs')
+        result['exported'] = Path(default_export).is_file()
+        # Remote selection is refused while readonly: the choice rows stay
+        # offered, but the dispatch must not move the selection (the retired
+        # 选择设备 button disabled itself in this state).
+        controller._remote_devices = [{'key': 'a' * 64, 'profile': 'xiaomi-rc003'}]
+        controller._remote_scan_valid = True
+        choices_before = list(controller.remoteDeviceChoices)
+        viewmodels.DeviceViewModel.useRemote('a' * 64)
+        result['select_disabled'] = list(controller.remoteDeviceChoices) == choices_before
+        # All three pages stay reachable and follow the page state.
+        page_stack = window.findChild(QObject, 'pageStack')
+        pages = []
         for index in (1, 2, 0):
-            tabs.setProperty('currentIndex', index)
+            viewmodels.AppViewModel.currentPage = index
             app.processEvents()
-        controller.exportLogs(classes['QUrl'].fromLocalFile(str(root / 'evidence.zip')))
-        result['exported'] = (root / 'evidence.zip').is_file()
+            pages.append(page_stack.property('currentIndex'))
+        result['pages_ok'] = pages == [1, 2, 0]
         if len(sys.argv) > 2:
             window.grabWindow().save(sys.argv[2])
         controller.requestApplicationExit()
@@ -291,6 +351,13 @@ with ExitStack() as patches:
     patches.enter_context(mock.patch.object(Controller, '__init__', init))
     patches.enter_context(mock.patch.object(Controller, '_request_endpoint_options_refresh'))
     patches.enter_context(mock.patch.object(Controller, '_request_voice_program_status_refresh'))
+    patches.enter_context(mock.patch.object(presentation_registry, 'register', capture_register))
+    # The production shell now runs the startup update check immediately
+    # (AppViewModel.startupSettled); the retired shell waited five seconds and
+    # this probe always exited first. Take the daily-claim rejection path so
+    # the probe never reaches the network - the update surface itself is
+    # asserted below through the rendered affordance.
+    patches.enter_context(mock.patch.object(m.application_update, 'claim_daily_update_check', return_value=False))
     patches.enter_context(mock.patch.dict(classes, {'QQmlApplicationEngine': engine_factory}))
     patches.enter_context(mock.patch.object(m.single_instance, 'register_settings_window_restore_event'))
     patches.enter_context(mock.patch.object(m.single_instance, 'release_settings_window_restore_event'))
@@ -323,8 +390,9 @@ class RecoveryWindowIntegrationTests(unittest.TestCase):
                 self.assertNotIn('error', evidence, evidence)
                 self.assertEqual(evidence['exit_code'], 0, evidence)
                 self.assertEqual(evidence['warnings'], [], evidence)
-                for field in ('warning_visible', 'readonly', 'visible', 'save_disabled',
-                              'select_disabled', 'export_enabled', 'update_enabled', 'exported', 'exit_confirmed', 'unchanged'):
+                for field in ('config_error_reported', 'readonly', 'visible', 'save_disabled',
+                              'select_disabled', 'export_enabled', 'update_enabled', 'pages_ok',
+                              'exported', 'exit_confirmed', 'unchanged'):
                     self.assertTrue(evidence[field], (field, evidence))
 
 

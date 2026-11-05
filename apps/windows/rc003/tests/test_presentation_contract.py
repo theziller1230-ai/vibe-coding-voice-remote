@@ -523,6 +523,47 @@ class NotifyLivenessTests(unittest.TestCase):
         self.assertEqual(fired, [1])
 
 
+class VoiceProgramIndexSpaceTests(unittest.TestCase):
+    """Row ids are SELECTABLE-order; the controller speaks PROVIDER-order.
+
+    Dispatching the row index directly turned the last selectable row
+    (Chatterfly) into the legacy ``custom`` slot, which the setter rejects -
+    picking Chatterfly was a silent no-op and the marked row was wrong too.
+    """
+
+    def _vm(self, provider_id):
+        from ovb_rc003 import voice_program_manager as _vpm
+
+        controller = FakeController()
+        controller.voiceProgramOptions = list(_vpm.provider_options())
+        controller.selectedVoiceProgramIndex = _vpm.provider_index(provider_id)
+        return VoiceViewModel(controller, FakeDiagnostics()), controller, _vpm
+
+    def test_chatterfly_selects_the_chatterfly_provider(self):
+        vm, controller, _vpm = self._vm("none")
+        vm.setVoiceProgram("4")  # the Chatterfly row
+        self.assertEqual(
+            controller.selectedVoiceProgramIndex,
+            _vpm.provider_index(_vpm.VOICE_PROGRAM_CHATTERFLY),
+            "row 4 must reach Chatterfly, not the legacy custom slot",
+        )
+
+    def test_marked_row_matches_the_current_provider(self):
+        vm, controller, _vpm = self._vm("chatterfly")
+        marked = [row.contract.id for row in vm.voicePrograms if row.contract.selected]
+        self.assertEqual(marked, ["4"], "Chatterfly must be the marked row")
+
+    def test_no_row_is_marked_for_a_legacy_custom_program(self):
+        vm, controller, _vpm = self._vm("custom")
+        marked = [row.contract.id for row in vm.voicePrograms if row.contract.selected]
+        self.assertEqual(marked, [], "custom is not one of the selectable rows")
+
+    def test_selectable_order_matches_the_menu_order(self):
+        vm, controller, _vpm = self._vm("sogou")
+        marked = [row.contract.id for row in vm.voicePrograms if row.contract.selected]
+        self.assertEqual(marked, ["1"], "sogou is the second selectable row")
+
+
 class OnboardingSurfaceTests(unittest.TestCase):
     """Doc §3 ``OnboardingViewModel`` surface - enforced whenever slice C's
     module is importable (the class itself is slice C's; this gate keeps it
