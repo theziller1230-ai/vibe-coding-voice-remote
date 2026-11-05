@@ -120,21 +120,29 @@ picked = voice_vm.pickCustomProgramPath(QUrl.fromLocalFile(str(path)).toString()
 assert picked.ok is True
 assert os.path.normcase(os.path.normpath(voice_vm.customProgramPath)) == os.path.normcase(os.path.normpath(str(path)))
 assert custom_path_field.property("text") == voice_vm.customProgramPath
-stored_path = voice_vm.customProgramPath
+# A typed existing program path is stored exactly (unquoted manual entry).
+typed = m.config.config_root() / "voice test2.exe"
+typed.touch()
+custom_path_field.setProperty("text", str(typed))
+assert QMetaObject.invokeMethod(custom_path_field, "editingFinished")
+render(window, app)
+typed_stored = voice_vm.customProgramPath
+assert os.path.normcase(os.path.normpath(typed_stored)) == os.path.normcase(os.path.normpath(str(typed)))
 # Typed entries validate through a file URL (the retired field stripped
-# quotes/arguments silently): a quoted entry is refused with the exact
-# message and leaves the stored path alone.
+# quotes/arguments silently and kept the bare executable): a quoted entry is
+# refused with the exact message and leaves the stored path alone.
 custom_path_field.setProperty("text", '"' + str(path) + '"')
 assert QMetaObject.invokeMethod(custom_path_field, "editingFinished")
 render(window, app)
 assert find(window, "settingsPanel").property("feedbackText") == "请选择本地程序文件。"
-assert voice_vm.customProgramPath == stored_path
-# Unquoted typed text round-trips exactly (the program-path contract of the
-# mapping editor); the retired field rewrote it to the bare executable.
-custom_path_field.setProperty("text", stored_path + " --argument")
+assert voice_vm.customProgramPath == typed_stored
+# An entry with arguments is not a real program file: the save refuses it
+# with the exact invalid-path message and preserves the stored path.
+custom_path_field.setProperty("text", typed_stored + " --argument")
 assert QMetaObject.invokeMethod(custom_path_field, "editingFinished")
 render(window, app)
-assert voice_vm.customProgramPath == stored_path + " --argument"
+assert voice_vm.customProgramPath == typed_stored
+assert controller.errorMessage == "自定义程序路径无效，请选择现有的 .exe 或有效的 .lnk。"
 
 # ---- 每档语音程序各自记住自启偏好；越界防线在真实选择后依旧生效 ----
 voice_vm.setVoiceProgram("1")
