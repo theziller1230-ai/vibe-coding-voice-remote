@@ -18,9 +18,11 @@ class NativeInventoryTests(unittest.TestCase):
     def test_real_inventory_covers_all_business_sources_and_navigation(self):
         root = BUILD.parent
         sources = inventory.module_sources(root)
+        # Recursive: a subpackage (presentation/) is business source too and
+        # must be in the native inventory just like the top-level modules.
         self.assertEqual(set(sources.values()),
-                         set((root / "src/ovb_rc003").glob("*.py"))
-                         - {root / "src/ovb_rc003/__init__.py"}
+                         {p for p in (root / "src/ovb_rc003").rglob("*.py")
+                          if p.name != "__init__.py"}
                          | {root / "scripts" / f"{n}.py" for n in inventory.NAVIGATION_MODULES})
         self.assertEqual(sources["ovb_rc003._native_main"].name, "__main__.py")
         self.assertTrue(set(inventory.LEGACY_MODULES) <= set(sources))
