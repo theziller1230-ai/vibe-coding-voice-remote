@@ -8,22 +8,9 @@ import unittest
 from tests.test_remote_selection import _QML_PROBE
 
 
-_PROBE = _QML_PROBE.split("click('selectRemoteButton')")[0] + r'''
+_PROBE = _QML_PROBE.split('# == shared journey marker ==')[0] + r'''
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
-for font_name in ('SegoeIcons.ttf', 'segmdl2.ttf'):
-    icon_font = Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Fonts' / font_name
-    if icon_font.is_file():
-        QFontDatabase.addApplicationFont(str(icon_font))
-
-def settle():
-    for _ in range(8):
-        app.processEvents()
-        window.grabWindow()
-
-def bounds(control):
-    point = control.mapToScene(QPointF(0, 0))
-    return (point.x(), point.y(), control.width(), control.height())
 
 def screenshot(name):
     directory = os.environ.get('SECONDARY_DIALOG_SCREENSHOTS')
@@ -35,43 +22,62 @@ for width, height in ((640, 480), (720, 560)):
     window.setWidth(width)
     window.setHeight(height)
     settle()
-    click('selectRemoteButton')
+    # The retired device dialog maps to the remote choice rows plus the
+    # useRemote(id) slot in the settings device section.
+    nav('settingsTabButton')
+    click('settingsDeviceSection_foldToggle')
+    click('settingsRefreshChecksButton')
     settle()
-    dialog = item('remoteDeviceDialog')
-    assert dialog.property('width') <= 520
-    assert dialog.property('height') < 250
-    for combo, action, other in (
-        ('remoteDeviceCombo', 'useRemoteButton', 'refreshRemotesButton'),
-    ):
-        cb, bt, extra = [bounds(item(n)) for n in (combo, action, other)]
-        assert 120 <= cb[2] < dialog.property('width'), cb
-        assert abs(cb[1] - bt[1]) < 1, (cb, bt)
-        assert abs(cb[1] - extra[1]) < 1, (cb, extra)
-        assert cb[0] + cb[2] <= bt[0], (cb, bt)
-        assert extra[0] + extra[2] < width, extra
-    screenshot(f'{width}-device')
-    dialog.setProperty('titleNote', '当前使用：' + '很长的遥控器名称' * 12)
+    choices = [(row.id, row.label, row.enabled, row.selected)
+               for row in _viewmodels.DeviceViewModel.remoteChoices]
+    assert [(row[0], row[1]) for row in choices] == [(A, selection.label(A)), (B, label_b)], choices
+    assert [row[2] for row in choices] == [True, True], choices
+    _viewmodels.DeviceViewModel.useRemote(A)
     settle()
-    assert dialog.property('width') <= 520
-    click('closeRemoteDialogButton')
-
-    item('tabBar').setProperty('currentIndex', 2)
-    settle()
-    for name in ('driverConfirmDialog', 'bridgeTestConfirmDialog'):
-        dialog = item(name)
+    assert controller.activeRemoteKey == A
+    choices = [(row.id, row.selected) for row in _viewmodels.DeviceViewModel.remoteChoices]
+    assert choices == [(A, True), (B, False)], choices
+    # The remaining secondary dialogs stay compact at every window size and
+    # style; a long title note never widens them.
+    for dialog_name, preferred in (('restoreDefaultsDialog', 420), ('deletePresetDialog', 420),
+                                   ('removeHelperDialog', 420), ('actionEditorDialog', 520),
+                                   ('shortcutRecorderDialog', 380)):
+        dialog = item(dialog_name)
         QMetaObject.invokeMethod(dialog, 'open')
         settle()
-        assert dialog.property('width') <= 390
-        assert 100 < dialog.property('height') < 250, (name, dialog.property('height'))
-        screenshot(f'{width}-{name}')
+        assert dialog.property('visible'), dialog_name
+        assert dialog.property('width') <= preferred, (dialog_name, dialog.property('width'))
+        assert dialog.property('width') <= width - 32, (dialog_name, dialog.property('width'))
+        screenshot(f'{width}-{dialog_name}')
         QTest.keyClick(window, Qt.Key_Escape)
         settle()
-        assert not dialog.property('visible')
+        assert not dialog.property('visible'), dialog_name
+    for dialog_name in ('restoreDefaultsDialog', 'deletePresetDialog', 'removeHelperDialog'):
+        dialog = item(dialog_name)
+        QMetaObject.invokeMethod(dialog, 'open')
+        settle()
+        assert 100 < dialog.property('height') < 250, (dialog_name, dialog.property('height'))
+        QTest.keyClick(window, Qt.Key_Escape)
+        settle()
+    editor = item('actionEditorDialog')
+    QMetaObject.invokeMethod(editor, 'open')
+    settle()
+    before = editor.property('width')
+    editor.setProperty('titleNote', '当前使用：' + '很长的遥控器名称' * 12)
+    settle()
+    assert editor.property('width') == before, (before, editor.property('width'))
+    screenshot(f'{width}-title-note')
+    QTest.keyClick(window, Qt.Key_Escape)
+    settle()
+    # The sound-channel test stays reachable from the voice section.
+    click('settingsVoiceSection_foldToggle')
+    audio_titles = find_all(item('settingsVoiceSection'), lambda node: node.metaObject().indexOfProperty('titleText') >= 0
+                            and node.property('titleText') == '声音通路')
+    assert audio_titles, '声音通路'
+    assert item('settingsTestAudioButton').property('enabled')
+    assert item('settingsInstallVirtualCableButton').property('enabled')
     assert not diagnostics.vbCableTestRunning
-
-    assert item('soundChannelTestRow').property('titleText') == '虚拟声卡'
     results.append({'size': [width, height], 'dialogs': 'opened-closed'})
-    item('tabBar').setProperty('currentIndex', 0)
 
 from PySide6.QtQml import QQmlComponent
 component = QQmlComponent(engine)

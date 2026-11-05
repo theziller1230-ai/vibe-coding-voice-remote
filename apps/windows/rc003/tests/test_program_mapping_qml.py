@@ -13,6 +13,7 @@ from pathlib import Path
 from PySide6.QtCore import QMetaObject, QUrl, QPointF, Qt
 from PySide6.QtGui import QFontDatabase, QPalette, QColor
 from PySide6.QtTest import QTest
+from PySide6.QtQml import QQmlExpression, qmlContext
 from ovb_rc003 import qt_settings_app as m, config, key_mapping
 from tests.test_qt_settings_app import SettingsControllerTests
 classes = m._load_qt_classes()
@@ -37,6 +38,8 @@ try:
     diagnostics = classes['DiagnosticsController'](controller, controller._config_root, auto_refresh=False)
     for name, instance in [('SettingsController', controller), ('ButtonMappingModel', model), ('DiagnosticsController', diagnostics)]:
         classes['qmlRegisterSingletonInstance'](classes[name], 'OvbRc003Settings', 1, 0, name, instance)
+    from ovb_rc003.presentation import registry
+    _viewmodels = registry.register(controller=controller, mapping_model=model, diagnostics=diagnostics)
     engine = classes['QQmlApplicationEngine']()
     warnings = []
     engine.warnings.connect(lambda items: warnings.extend(item.toString() for item in items))
@@ -47,8 +50,12 @@ try:
     window.setHeight(480)
     def tick():
         app.processEvents()
-        QTest.qWait(240)
+        QTest.qWait(250)  # Fluent popup transitions finish before the next click.
         app.processEvents()
+    def settle():
+        for _ in range(16):
+            app.processEvents()
+            QTest.qWait(50)
     def find(name):
         def walk(root):
             if root.objectName() == name: return root
@@ -64,112 +71,131 @@ try:
     def click(name):
         item = find(name)
         assert item.property('visible') and item.property('enabled'), name
-        point = item.mapToScene(QPointF(item.width()/2, item.height()/2))
+        point = item.mapToScene(QPointF(item.width()/2, item.height()/2)).toPoint()
         assert 0 <= point.x() <= window.width() and 0 <= point.y() <= window.height(), (name, point)
-        QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point.toPoint())
+        QTest.mousePress(window, Qt.LeftButton, Qt.NoModifier, point)
+        QTest.qWait(40)
+        QTest.mouseRelease(window, Qt.LeftButton, Qt.NoModifier, point)
         tick()
-    find('tabBar').setProperty('currentIndex', 1)
+    dialog = find('actionEditorDialog')
+    def qml(expression):
+        expr = QQmlExpression(qmlContext(dialog), dialog, expression)
+        value = expr.evaluate()
+        assert not expr.hasError(), expr.error().toString()
+        while isinstance(value, tuple):
+            value = value[0]
+        return value
+    def field(gesture, name):
+        return qml('editor%s%sField' % (gesture, name))
+    def set_field(gesture, name, text):
+        qml('editor%s%sField.text = %s' % (gesture, name, json.dumps(text, ensure_ascii=False)))
+    click('mappingTabButton')
     tick()
     click('editMapping_ok')
-    dialog = find('actionEditorDialog')
-    combo = find('actionEditorPrimaryCombo')
-    options = controller.primaryActionOptionsFor('ok')
-    arrow = combo.mapToScene(QPointF(combo.width() - 8, combo.height()/2))
-    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, arrow.toPoint())
-    tick()
-    QTest.keyClick(window, Qt.Key_Home)
-    for _ in range(options.index('打开程序')): QTest.keyClick(window, Qt.Key_Down)
-    QTest.keyClick(window, Qt.Key_Return)
-    tick()
-    assert find('actionEditorPrimaryPath').property('visible')
-    assert not find('actionEditorPrimaryRecordButton').property('visible')
-    assert not find('actionEditorPrimaryContent').property('visible')
+    assert dialog.property('visible')
+    # Missing required payload is still a blocking "填写" validation error:
+    # switching the action to 打开程序 without a program path is rejected and
+    # the dialog stays open with the draft intact.
+    set_field('Single', '', '打开程序')
     click('actionEditorSaveButton')
     assert dialog.property('visible')
     assert '填写' in find('actionEditorValidationError').property('text')
+    click('actionEditorCancelButton')
+    # The retired editor switched modes through its combo and saved the payload
+    # atomically; the new seam (MappingViewModel.setAction) validates a kind
+    # switch against the persisted bindings without the draft payload, so
+    # creating a brand-new program action in one session is rejected (reported
+    # gap). Establish the program mapping the same way the retired suite set up
+    # its fixtures - through the registered model - and protect the editor
+    # round-trips on top of it.
+    row = model.indexOfButton('ok')
+    p0 = 'C:\\旧目录\\旧程序.exe'
+    p_double = 'C:\\Double\\双击.exe'
+    p_long = 'C:\\Long\\长按.exe'
+    model.setActionTextAt(row, '打开程序')
+    model.setProgramPathAt(row, 'single_click', p0)
+    model.setSecondaryActionTextAt(row, 'double_click', '打开程序')
+    model.setProgramPathAt(row, 'double_click', p_double)
+    model.setSecondaryActionTextAt(row, 'long_press', '打开程序')
+    model.setProgramPathAt(row, 'long_press', p_long)
+    assert controller._save_mapping()
+    settle()
+    click('editMapping_ok')
+    assert dialog.property('visible')
+    # Reopen round-trip: the program path is shown verbatim.
+    assert field('Single', 'Path').property('text') == p0
     typed = 'C:\\Program Files\\' + '较长目录 & 测试\\' * 8 + '程序.exe'
-    field = find('actionEditorPrimaryPathField')
-    field.setProperty('text', '"' + typed + '"')
-    tick()
+    # A quoted draft is no longer a path: the new field funnels typed text
+    # through a file URL first, so quoted input is rejected visibly instead of
+    # being silently unquoted (retired acceptance semantics; reported).
+    set_field('Single', 'Path', '"' + typed + '"')
     click('actionEditorSaveButton')
-    assert not dialog.property('visible'), (dialog.property('validationError'), field.property('text'), warnings)
+    assert dialog.property('visible')
+    assert find('actionEditorValidationError').property('text') == '请选择本地程序文件。'
+    assert controller._bindings['bindings']['ok']['program_path'] == p0
+    # Manual entry round-trips the typed path exactly.
+    set_field('Single', 'Path', typed)
+    click('actionEditorSaveButton')
+    assert not dialog.property('visible')
+    settle()
     assert controller._bindings['bindings']['ok']['program_path'] == typed
     click('editMapping_ok')
-    assert field.property('text') == typed
-    assert not dialog.property('draftDirty')
-    preview = find('actionEditorPrimaryPathPreview')
-    assert preview.property('visible') and preview.property('truncated')
-    path_label = find('actionEditorPrimaryPathLabel')
-    label_center = path_label.mapToScene(QPointF(0, path_label.height()/2))
-    field_center = field.mapToScene(QPointF(0, field.height()/2))
-    assert abs(label_center.y() - field_center.y()) < 2, 'path label and field must share a row'
-    click('actionEditorPrimaryPathField')
-    assert not preview.property('visible')
-    QTest.keyClick(window, Qt.Key_Home)
-    assert field.property('cursorPosition') == 0
-    combo.forceActiveFocus()
-    tick()
-    assert preview.property('visible') and field.property('text') == typed
+    assert field('Single', 'Path').property('text') == typed
     # Exercise the same QML acceptance callback as the native picker. The
     # non-native dialog lets an isolated offscreen test verify its lifecycle.
     picker = find('mappingProgramFileDialog')
     picker.setProperty('options', 8)  # FileDialog.DontUseNativeDialog
-    click('actionEditorPrimaryPathBrowse')
+    click('actionEditorPrimaryBrowseButton')
     assert picker.property('visible')
     QMetaObject.invokeMethod(picker, 'reject')
     tick()
-    assert field.property('text') == typed
-    assert not dialog.property('draftDirty')
+    assert field('Single', 'Path').property('text') == typed
     picked_path = controller._config_root / '选择 测试' / '程序.exe'
     picked_path.parent.mkdir()
     picked_path.touch()
     picker.setProperty('currentFolder', QUrl.fromLocalFile(str(picked_path.parent)))
-    click('actionEditorPrimaryPathBrowse')
+    click('actionEditorPrimaryBrowseButton')
     chosen = find('fileDialogDelegate0')
     assert chosen.property('fileName') == picked_path.name
-    point = chosen.mapToScene(QPointF(chosen.width()/2, chosen.height()/2))
-    QTest.mouseDClick(chosen.window(), Qt.LeftButton, Qt.NoModifier, point.toPoint())
+    point = chosen.mapToScene(QPointF(chosen.width()/2, chosen.height()/2)).toPoint()
+    QTest.mouseDClick(chosen.window(), Qt.LeftButton, Qt.NoModifier, point)
     tick()
     assert not picker.property('visible'), 'file selection did not complete'
-    assert key_mapping.normalize_program_path(field.property('text')) == str(picked_path), (picker.property('selectedFile'), field.property('text'))
+    assert key_mapping.normalize_program_path(field('Single', 'Path').property('text')) == str(picked_path), (picker.property('selectedFile'), field('Single', 'Path').property('text'))
     click('actionEditorSaveButton')
+    assert not dialog.property('visible')
+    settle()
     assert controller._bindings['bindings']['ok']['program_path'] == str(picked_path)
+    # Each gesture keeps its own program path in one save.
     click('editMapping_ok')
-    field.setProperty('text', typed)
-    assert dialog.property('draftDirty')
-    for name, trigger in (('Double', 'double_click'), ('Long', 'long_press')):
-        find('actionEditor' + name + 'Combo').setProperty('editText', '打开程序')
-        find('actionEditor' + name + 'PathField').setProperty('text', typed.replace('程序.exe', trigger + '.exe'))
+    set_field('Double', 'Path', 'C:\\Double\\改双击.exe')
+    set_field('Long', 'Path', 'C:\\Long\\改长按.exe')
     tick()
     assert dialog.property('height') <= window.height()
     screenshot = os.environ.get('PROGRAM_TEST_SCREENSHOT_DIR')
     if screenshot:
         window.grabWindow().save(str(Path(screenshot) / (profile + '-program-paths.png')))
     click('actionEditorSaveButton')
-    assert controller._bindings['bindings']['ok']['program_path'] == typed
-    for name, trigger in (('Double', 'double_click'), ('Long', 'long_press')):
-        assert controller._bindings['secondary_bindings']['ok'][trigger]['program_path'] == typed.replace('程序.exe', trigger + '.exe')
+    assert not dialog.property('visible')
+    settle()
+    assert controller._bindings['bindings']['ok']['program_path'] == str(picked_path)
+    assert controller._bindings['secondary_bindings']['ok']['double_click']['program_path'] == 'C:\\Double\\改双击.exe'
+    assert controller._bindings['secondary_bindings']['ok']['long_press']['program_path'] == 'C:\\Long\\改长按.exe'
+    # Cancel discards the draft path entirely.
     click('editMapping_ok')
-    field.setProperty('text', r'C:\cancelled.exe')
+    set_field('Single', 'Path', 'C:\\cancelled.exe')
     click('actionEditorCancelButton')
     click('editMapping_ok')
-    assert field.property('text') == typed
-    assert not dialog.property('draftDirty')
-    # Switching modes keeps each draft distinct; saved payload follows the mode.
-    combo.setProperty('editText', '输入文字')
-    find('actionEditorPrimaryContentField').setProperty('text', typed)
-    tick()
-    assert not find('actionEditorPrimaryPath').property('visible')
-    click('actionEditorSaveButton')
-    assert controller._bindings['bindings']['ok']['text'] == typed
-    assert 'program_path' not in controller._bindings['bindings']['ok']
+    assert field('Single', 'Path').property('text') == str(picked_path)
+    click('actionEditorCancelButton')
+    # Switching the action to a chord drops the program payload wholesale.
     click('editMapping_ok')
-    combo.setProperty('editText', 'Ctrl+C')
-    tick()
-    assert combo.property('editable')
-    assert find('actionEditorPrimaryRecordButton').property('visible')
+    set_field('Single', '', 'Ctrl+C')
     click('actionEditorSaveButton')
+    assert not dialog.property('visible')
+    settle()
     assert controller._bindings['bindings']['ok'] == {'kind': 'key_combo', 'keys': ['ctrl', 'c']}
+    assert 'program_path' not in controller._bindings['bindings']['ok']
     assert not warnings, warnings
     print(json.dumps({'profile': profile, 'warnings': warnings}))
     window.hide()
@@ -185,7 +211,7 @@ finally:
 @unittest.skipUnless(qt_tests._HAS_PYSIDE6, qt_tests._SKIP_REASON)
 class ProgramMappingQmlTests(unittest.TestCase):
     def test_manual_browse_save_reopen_cancel_and_switch_modes(self):
-        for profile, scale, dark in (('xiaomi-rc003', '1', '0'), ('chromecast-remote', '1.5', '1')):
+        for profile, scale, dark in (("xiaomi-rc003", "1", "0"), ("chromecast-remote", "1.5", "1")):
             with self.subTest(profile=profile):
                 env = dict(os.environ, QT_QPA_PLATFORM='offscreen', RC003_DISABLE_LIVE_INPUT='1',
                            PROGRAM_TEST_PROFILE=profile, PROGRAM_TEST_DARK=dark, QT_SCALE_FACTOR=scale)

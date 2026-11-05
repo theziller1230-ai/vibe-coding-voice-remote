@@ -9782,16 +9782,57 @@ m.single_instance.bridge_instance_running = lambda: slow_bridge_exit
 visibility = {
     "after_close": None,
     "during_cleanup": None,
-    "unsaved_dialog": None,
+    "visible_before_exit": None,
     "saved_endpoint_name": None,
 }
+window_ref = []
 
 if slow_bridge_exit:
     def delayed_bridge_exit(**_kwargs):
         time.sleep(0.6)
+        if window_ref:
+            # Sampled after the slow stop: the window must have stayed hidden
+            # for the whole bridge teardown, not merely at close time.
+            visibility["during_cleanup"] = bool(window_ref[0].property("visible"))
         return SimpleNamespace(stopped=True, error="")
 
     m.bridge_control_windows.request_bridge_exit = delayed_bridge_exit
+
+
+# Record the D7 save-on-exit decision (MaintenanceViewModel.confirmExitSave,
+# dispatched by main.qml's performExit()) at the controller calls it makes:
+# the eligibility check it consults first, then exactly one of the two exit
+# dispatches. All three are plain Python calls out of the decision, so
+# class-level recorders observe them (the decision itself is entered from QML
+# through the meta-object and cannot be wrapped from Python).
+controller_class = m._load_qt_classes()["SettingsController"]
+original_can_auto_save = controller_class.canAutoSaveMappingBeforeExit
+original_save_settings_and_exit = controller_class.saveSettingsAndExit
+original_request_application_exit = controller_class.requestApplicationExit
+decision_checks = []
+save_then_exit_calls = []
+request_exit_calls = []
+
+
+def recorded_can_auto_save(self):
+    verdict = original_can_auto_save(self)
+    decision_checks.append(bool(verdict))
+    return verdict
+
+
+def recorded_save_then_exit(self):
+    save_then_exit_calls.append(True)
+    return original_save_settings_and_exit(self)
+
+
+def recorded_request_exit(self):
+    request_exit_calls.append(True)
+    return original_request_application_exit(self)
+
+
+controller_class.canAutoSaveMappingBeforeExit = recorded_can_auto_save
+controller_class.saveSettingsAndExit = recorded_save_then_exit
+controller_class.requestApplicationExit = recorded_request_exit
 
 
 def connect_application_exit_and_schedule(app, controller):
@@ -9803,6 +9844,8 @@ def connect_application_exit_and_schedule(app, controller):
             if not windows:
                 app.exit(23)
                 return
+            window_ref.append(windows[0])
+            visibility["visible_before_exit"] = bool(windows[0].property("visible"))
             if action == "window_close_quit_mixed_dirty":
                 endpoint = m.audio_output.AudioEndpoint(
                     name="Migrated Output",
@@ -9819,6 +9862,10 @@ def connect_application_exit_and_schedule(app, controller):
                     "ctrl+l",
                 )
             windows[0].close()
+            if action != "window_close_hide":
+                # Sampled synchronously after the close handler returned: the
+                # new exit lifecycle hides the window before any teardown.
+                visibility["after_close"] = bool(windows[0].property("visible"))
             return
         controller.requestApplicationExit()
 
@@ -9832,36 +9879,6 @@ def connect_application_exit_and_schedule(app, controller):
             controller.requestApplicationExit()
 
         QTimer.singleShot(300, finish_hide_probe)
-    if action == "window_close_quit_mixed_dirty":
-        def finish_mixed_dirty_probe():
-            windows = app.topLevelWindows()
-            window = windows[0] if windows else None
-            dialog = (
-                window.findChild(QObject, "unsavedExitDialog")
-                if window is not None
-                else None
-            )
-            visibility["after_close"] = (
-                window.isVisible() if window is not None else None
-            )
-            visibility["unsaved_dialog"] = (
-                bool(dialog.property("visible")) if dialog is not None else False
-            )
-            saved = m.config.load_config(m.config.config_path())
-            visibility["saved_endpoint_name"] = saved.get(
-                "output_endpoint_name", ""
-            )
-            controller.requestApplicationExit()
-
-        QTimer.singleShot(300, finish_mixed_dirty_probe)
-    if slow_bridge_exit:
-        def record_visibility():
-            windows = app.topLevelWindows()
-            visibility["during_cleanup"] = (
-                windows[0].isVisible() if windows else None
-            )
-
-        QTimer.singleShot(150, record_visibility)
 
 
 m._connect_application_exit = connect_application_exit_and_schedule
@@ -9877,13 +9894,19 @@ started = time.monotonic()
 result = m.run_settings_window(
     start_hidden=action not in window_close_actions
 )
+if action == "window_close_quit_mixed_dirty":
+    saved = m.config.load_config(m.config.config_path())
+    visibility["saved_endpoint_name"] = saved.get("output_endpoint_name", "")
 print(json.dumps({
     "action": action,
     "result": result,
     "elapsed": time.monotonic() - started,
+    "visible_before_exit": visibility["visible_before_exit"],
     "visible_after_close": visibility["after_close"],
     "visible_during_cleanup": visibility["during_cleanup"],
-    "unsaved_dialog": visibility["unsaved_dialog"],
+    "decision_checks": len(decision_checks),
+    "save_then_exit_calls": len(save_then_exit_calls),
+    "request_exit_calls": len(request_exit_calls),
     "saved_endpoint_name": visibility["saved_endpoint_name"],
 }))
 """
@@ -9930,6 +9953,10 @@ diagnostics_controller = DiagnosticsController(controller, m.config.config_root(
 qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
 qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
 qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
+from ovb_rc003.presentation import registry
+_viewmodels = registry.register(
+    controller=controller, mapping_model=model, diagnostics=diagnostics_controller
+)
 
 engine = QQmlApplicationEngine()
 qml_dir = m._qml_directory()
@@ -9944,79 +9971,66 @@ print("STAGE:loaded", file=sys.stderr, flush=True)
 
 root_objects = engine.rootObjects()
 app.processEvents()
+if root_objects:
+    for _ in range(10):
+        root_objects[0].grabWindow()
+        app.processEvents()
 initial_settings_dirty = bool(controller.settingsDirty)
-tab_bar = root_objects[0].findChild(QObject, "tabBar") if root_objects else None
-if tab_bar is not None:
-    tab_bar.setProperty("currentIndex", 2)
-    app.processEvents()
-voice_scroll = (
-    root_objects[0].findChild(QObject, "voiceScroll") if root_objects else None
-)
-voice_page = voice_scroll.parent() if voice_scroll is not None else None
 hotkey_before_capture = controller.holdVoiceHotkeyText
-hotkey_before_stop_completed = hotkey_before_capture
-recording_before_stop_completed = False
-pending_before_stop_completed = ""
-if voice_page is not None:
-    class BlockingHotkeyCapture:
-        def __init__(self):
-            self.stop_started = threading.Event()
-            self.allow_stop = threading.Event()
 
-        def stop(self):
-            self.stop_started.set()
-            if not self.allow_stop.wait(5.0):
-                raise RuntimeError("test capture stop timed out")
 
-    blocking_capture = BlockingHotkeyCapture()
-    controller._hotkey_capture = blocking_capture
-    controller._set_input_operation_state("hotkey", "active")
-    voice_page.setProperty("voiceHotkeyRecording", True)
-    controller.hotkeyCaptured.emit("ctrl+shift+f8")
-    stop_deadline = time.monotonic() + 5.0
-    while not blocking_capture.stop_started.is_set() and time.monotonic() < stop_deadline:
-        app.processEvents()
-        time.sleep(0.01)
+class BlockingHotkeyCapture:
+    def __init__(self):
+        self.stop_started = threading.Event()
+        self.allow_stop = threading.Event()
+
+    def stop(self):
+        self.stop_started.set()
+        if not self.allow_stop.wait(5.0):
+            raise RuntimeError("test capture stop timed out")
+
+
+blocking_capture = BlockingHotkeyCapture()
+controller._hotkey_capture = blocking_capture
+controller._set_input_operation_state("hotkey", "active")
+controller.hotkeyCaptured.emit("ctrl+shift+f8")
+# The new voice surface commits the captured chord at hotkeyCaptured (the
+# retired VoicePage staged it until the capture stop settled - behavior
+# delta recorded in the delivery report); the teardown still runs through
+# the real recorder-stop path below.
+_viewmodels.VoiceViewModel.stopHotkeyCapture()
+stop_deadline = time.monotonic() + 5.0
+while not blocking_capture.stop_started.is_set() and time.monotonic() < stop_deadline:
     app.processEvents()
-    hotkey_before_stop_completed = controller.holdVoiceHotkeyText
-    recording_before_stop_completed = bool(
-        voice_page.property("voiceHotkeyRecording")
-    )
-    pending_before_stop_completed = str(
-        voice_page.property("pendingVoiceHotkey")
-    )
-    blocking_capture.allow_stop.set()
-    deadline = time.monotonic() + 5.0
-    while (controller.hotkeyCaptureActive or controller.voiceHotkeyBusy) \
-            and time.monotonic() < deadline:
-        app.processEvents()
-        time.sleep(0.01)
+    time.sleep(0.01)
+blocking_capture.allow_stop.set()
+deadline = time.monotonic() + 5.0
+while (controller.hotkeyCaptureActive or controller.voiceHotkeyBusy) \
+        and time.monotonic() < deadline:
     app.processEvents()
+    time.sleep(0.01)
+app.processEvents()
 saved_config = m.config.load_config(m.config.config_path(m.config.config_root()))
 voice_save_status = controller.statusMessage
-status_bar = (
-    root_objects[0].findChild(QObject, "globalStatusBar") if root_objects else None
-)
-tab_bar.setProperty("currentIndex", 0)
-app.processEvents()
-voice_feedback_on_device = bool(status_bar.property("hasStatus"))
-tab_bar.setProperty("currentIndex", 2)
-app.processEvents()
-voice_feedback_on_voice = bool(status_bar.property("hasStatus"))
-tab_bar.setProperty("currentIndex", 1)
-model.setActionTextAt(model.index_of("power"), "escape")
-app.processEvents()
-mapping_dirty_on_buttons = bool(status_bar.property("hasStatus"))
-tab_bar.setProperty("currentIndex", 2)
-app.processEvents()
-mapping_dirty_on_voice = bool(status_bar.property("hasStatus"))
+hotkey_label = _viewmodels.VoiceViewModel.hotkeyLabel
+expected_hotkey_label = controller.formatHotkeyText("ctrl+shift+f8")
 root_window = root_objects[0]
 root_window.hide()
 app.processEvents()
 hidden_before_restore = not bool(root_window.property("visible"))
-controller.windowRestoreRequested.emit()
-app.processEvents()
-restored_by_request = bool(root_window.property("visible"))
+# Restore requests enter as a single-instance poll result; the real shell
+# timer drives the AppViewModel restore poll, which raises the window
+# through the AppViewModel.windowRestoreRequested binding in main.qml.
+m.single_instance.consume_settings_window_restore_request = lambda *_args: True
+restore_deadline = time.monotonic() + 3.0
+restored_by_request = False
+while time.monotonic() < restore_deadline:
+    root_window.grabWindow()
+    app.processEvents()
+    if bool(root_window.property("visible")):
+        restored_by_request = True
+        break
+    time.sleep(0.01)
 root_window.close()
 app.processEvents()
 hidden_after_second_close = not bool(root_window.property("visible"))
@@ -10031,20 +10045,10 @@ result = {
         root_objects
         and root_objects[0].findChild(QObject, "voiceReleaseFinishTapSwitch")
     ),
-    "voice_hotkey_recording": (
-        voice_page.property("voiceHotkeyRecording")
-        if voice_page is not None else None
-    ),
-    "hotkey_before_capture": hotkey_before_capture,
-    "hotkey_before_stop_completed": hotkey_before_stop_completed,
-    "recording_before_stop_completed": recording_before_stop_completed,
-    "pending_before_stop_completed": pending_before_stop_completed,
+    "hotkey_label": hotkey_label,
+    "expected_hotkey_label": expected_hotkey_label,
     "saved_voice_hotkey": saved_config.get("voice_hotkeys", {}).get("hold"),
     "voice_save_status": voice_save_status,
-    "voice_feedback_on_device": voice_feedback_on_device,
-    "voice_feedback_on_voice": voice_feedback_on_voice,
-    "mapping_dirty_on_buttons": mapping_dirty_on_buttons,
-    "mapping_dirty_on_voice": mapping_dirty_on_voice,
     "hidden_before_restore": hidden_before_restore,
     "restored_by_request": restored_by_request,
     "hidden_after_second_close": hidden_after_second_close,
@@ -10073,7 +10077,7 @@ import json
 import sys
 import time
 
-from PySide6.QtCore import QObject, QPointF, Qt
+from PySide6.QtCore import QMetaObject, QObject, QPointF, Qt
 from PySide6.QtTest import QTest
 from ovb_rc003 import qt_settings_app as m
 
@@ -10175,6 +10179,10 @@ diagnostics_controller = DiagnosticsController(controller, m.config.config_root(
 qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
 qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
 qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
+from ovb_rc003.presentation import registry
+_viewmodels = registry.register(
+    controller=controller, mapping_model=model, diagnostics=diagnostics_controller
+)
 
 engine = QQmlApplicationEngine()
 qml_dir = m._qml_directory()
@@ -10188,20 +10196,34 @@ window.setProperty("width", 640)
 window.setProperty("height", 480)
 window.show()
 
-dialog = find_child(window, "hidHelperSetupDialog")
-body = find_child(window, "hidHelperSetupBody")
-decline = find_child(window, "cancelHidHelperSetupButton")
-confirm = find_child(window, "confirmHidHelperSetupButton")
-repair = find_child(window, "repairHidHelperButton")
-assert all(item is not None for item in (dialog, body, decline, confirm, repair))
+_viewmodels.AppViewModel.currentPage = 2
+maintenance_section = find_child(window, "settingsMaintenanceSection")
+remove_button = find_child(window, "settingsRemoveHelperButton")
+dialog = find_child(window, "removeHelperDialog")
+assert maintenance_section is not None
+assert remove_button is not None and dialog is not None
+
+def settle(count=8):
+    for _ in range(count):
+        window.grabWindow()
+        app.processEvents()
+
+settle()
+helper_item_labels = [
+    row.fixLabel for row in _viewmodels.MaintenanceViewModel.items if row.id == "helper"
+]
+assert helper_item_labels == ["修复"]
 if "--elevated" in sys.argv:
-    assert render_until(window, app, lambda: bool(window.property("portableHidSetupPromptAttempted")))
+    # An elevated launch must show no HID-permission nag at all: no dialog,
+    # and the maintenance surface starts folded so nothing asks for
+    # attention; nothing may reach for UAC unprompted.
     saved = m.config.load_config(m.config.config_path(m.config.config_root()))
     result = {
         "warnings": [warning.toString() for warning in warnings],
         "window_visible": bool(window.property("visible")),
         "dialog_visible": bool(dialog.property("visible")),
-        "repair_visible": bool(repair.property("visible")),
+        "maintenance_folded": bool(maintenance_section.property("folded")),
+        "helper_fix_label": helper_item_labels[0],
         "install_call_count": len(install_calls),
         "saved_offer_id": saved.get("hid_helper_setup_prompted_offer_id", ""),
     }
@@ -10209,12 +10231,22 @@ if "--elevated" in sys.argv:
     m._shutdown_diagnostics_workers()
     print(json.dumps(result))
     sys.exit(0)
-assert render_until(window, app, lambda: bool(dialog.property("visible")))
 
+# The surviving HID permission dialog is the removal confirm (the first-run
+# setup prompt is a D7 retirement): it must stay compact and clear, and
+# opening or declining it must never request UAC.
+maintenance_section.setProperty("folded", False)
+settle()
+remove_button.forceActiveFocus(Qt.TabFocusReason)
+settle(3)
+QMetaObject.invokeMethod(
+    remove_button, "clicked", Qt.ConnectionType.DirectConnection
+)
+assert render_until(window, app, lambda: bool(dialog.property("visible")))
 dialog_geometry = popup_geometry(dialog)
+content_item = dialog.property("contentItem")
+body = content_item.childItems()[0]
 body_geometry = item_geometry(body)
-decline_geometry = item_geometry(decline)
-confirm_geometry = item_geometry(confirm)
 initial = {
     "dialog_visible": bool(dialog.property("visible")),
     "dialog_title": str(dialog.property("title")),
@@ -10223,26 +10255,16 @@ initial = {
     "body_implicit_height": float(body.property("implicitHeight")),
     "dialog": dialog_geometry,
     "body": body_geometry,
-    "decline": decline_geometry,
-    "confirm": confirm_geometry,
-    "decline_text": str(decline.property("text")),
-    "decline_flat": bool(decline.property("flat")),
-    "decline_highlighted": bool(decline.property("highlighted")),
-    "confirm_text": str(confirm.property("text")),
-    "confirm_flat": bool(confirm.property("flat")),
-    "confirm_highlighted": bool(confirm.property("highlighted")),
 }
 
-decline_point = decline.mapToScene(
-    QPointF(float(decline.property("width")) / 2.0, float(decline.property("height")) / 2.0)
-).toPoint()
-QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, decline_point)
+QMetaObject.invokeMethod(
+    dialog, "reject", Qt.ConnectionType.DirectConnection
+)
 assert render_until(window, app, lambda: not bool(dialog.property("visible")))
-
-repair_point = repair.mapToScene(
-    QPointF(float(repair.property("width")) / 2.0, float(repair.property("height")) / 2.0)
-).toPoint()
-QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, repair_point)
+focus_restored = bool(remove_button.property("activeFocus"))
+QMetaObject.invokeMethod(
+    remove_button, "clicked", Qt.ConnectionType.DirectConnection
+)
 assert render_until(window, app, lambda: bool(dialog.property("visible")))
 
 saved = m.config.load_config(m.config.config_path(m.config.config_root()))
@@ -10251,8 +10273,9 @@ result = {
     "window_width": float(window.property("width")),
     "window_height": float(window.property("height")),
     "initial": initial,
+    "focus_restored": focus_restored,
     "dialog_reopened": bool(dialog.property("visible")),
-    "repair_visible": bool(repair.property("visible")),
+    "helper_fix_label": helper_item_labels[0],
     "install_call_count": len(install_calls),
     "saved_offer_id": saved.get("hid_helper_setup_prompted_offer_id"),
 }
@@ -10352,6 +10375,10 @@ diagnostics_controller = DiagnosticsController(
 qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
 qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
 qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
+from ovb_rc003.presentation import registry
+_viewmodels = registry.register(
+    controller=controller, mapping_model=model, diagnostics=diagnostics_controller
+)
 
 engine = QQmlApplicationEngine()
 qml_dir = m._qml_directory()
@@ -10365,80 +10392,80 @@ window.setWidth(int(os.environ["PROBE_WIDTH"]))
 window.setHeight(int(os.environ["PROBE_HEIGHT"]))
 window.show()
 render(window, app)
+_viewmodels.AppViewModel.currentPage = 2
+render(window, app)
 
-update_button = find_child(window, "checkApplicationUpdateButton")
-usage_link = find_child(window, "deviceUsageLink")
-log_button = find_child(window, "deviceOpenLogButton")
-location_link = find_child(window, "deviceLogLocationLink")
-assert all(item is not None for item in (update_button, log_button, usage_link, location_link))
-usage_link.forceActiveFocus(Qt.TabFocusReason)
+# Tab traversal across the maintenance command links, forward and backward.
+maintenance_section = find_child(window, "settingsMaintenanceSection")
+assert maintenance_section is not None
+maintenance_section.setProperty("folded", False)
+render(window, app)
+privacy_link = find_child(window, "settingsMicrophonePrivacyLink")
+speech_link = find_child(window, "settingsSpeechSettingsLink")
+assert privacy_link is not None and speech_link is not None
+privacy_link.forceActiveFocus(Qt.TabFocusReason)
 render(window, app, 3)
 QTest.keyClick(window, Qt.Key_Tab)
 render(window, app, 3)
-tab_forward = bool(update_button.property("activeFocus"))
+tab_forward = bool(speech_link.property("activeFocus"))
 QTest.keyClick(window, Qt.Key_Backtab)
 render(window, app, 3)
-tab_backward = bool(usage_link.property("activeFocus"))
-log_button.forceActiveFocus(Qt.TabFocusReason)
-QTest.keyClick(window, Qt.Key_Tab)
+tab_backward = bool(privacy_link.property("activeFocus"))
+
+# The SettingsDialog-based HID removal dialog fits the viewport at this
+# window size and restores focus to its opener when closed.
+remove_button = find_child(window, "settingsRemoveHelperButton")
+remove_dialog = find_child(window, "removeHelperDialog")
+assert remove_button is not None and remove_dialog is not None
+remove_button.forceActiveFocus(Qt.TabFocusReason)
 render(window, app, 3)
-assert location_link.property("activeFocus")
-QTest.keyClick(window, Qt.Key_Tab)
-render(window, app, 3)
-assert find_child(window, "diagnosticTraceSwitch").property("activeFocus")
-QTest.keyClick(window, Qt.Key_Backtab)
-render(window, app, 3)
-assert location_link.property("activeFocus")
-QTest.keyClick(window, Qt.Key_Backtab)
-render(window, app, 3)
-assert log_button.property("activeFocus")
+QMetaObject.invokeMethod(
+    remove_button, "clicked", Qt.ConnectionType.DirectConnection
+)
+render(window, app, 6)
+assert bool(remove_dialog.property("visible")), "removeHelperDialog did not open"
+remove_dialog_geometry = popup_geometry(remove_dialog)
+QMetaObject.invokeMethod(
+    remove_dialog, "reject", Qt.ConnectionType.DirectConnection
+)
+focus_restored = False
+for _ in range(50):
+    render(window, app, 1)
+    if (not bool(remove_dialog.property("visible"))
+            and bool(remove_button.property("activeFocus"))):
+        focus_restored = True
+        break
+
 from unittest import mock
 
-def click_item(item):
-    point = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
-    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
-    render(window, app, 3)
-
+# The usage guide and log export/location flows moved from the retired
+# device-page links to typed MaintenanceViewModel slots; the controller
+# flows behind them are unchanged.
 target = f"https://github.com/{u.REPOSITORY_SLUG}#readme"
 with mock.patch.object(m.shell_targets, "open_external_target", return_value=
         m.shell_targets.ExternalTargetResult(m.shell_targets.ExternalTargetOutcome.OPENED, target)) as opener:
-    click_item(usage_link)
+    _viewmodels.MaintenanceViewModel.run("guide")
     opener.assert_called_once_with(target)
 
-log_dialog = find_child(window, "logExportDialog")
-assert log_dialog is not None
-# Keep this isolated GUI check off the actual Windows desktop/native save dialog.
-option_property = log_dialog.metaObject().property(log_dialog.metaObject().indexOfProperty("options"))
-non_native_option, valid_option = option_property.enumerator().keyToValue("DontUseNativeDialog")
-assert valid_option
-log_dialog.setProperty("options", non_native_option)
-from PySide6.QtCore import QStandardPaths
-QStandardPaths.writableLocation = staticmethod(lambda _location: str(m.config.config_root()))
 m.log_export.default_filename = lambda: "日志导出测试.zip"
 destination = m.config.config_root() / "日志导出测试.zip"
 destination.parent.mkdir(parents=True, exist_ok=True)
+log_url = "file:///" + str(destination).replace("\\", "/")
 for enabled in (False, True):
     controller._diagnostic_trace_enabled = enabled
     controller.desktopBehaviorChanged.emit()
     render(window, app, 3)
-    assert log_button.property("enabled")
-    click_item(log_button)
-    assert log_dialog.property("visible")
-    if not enabled:
-        QMetaObject.invokeMethod(log_dialog, "reject", Qt.DirectConnection)
-        render(window, app, 3)
-        assert log_button.property("activeFocus")
-        click_item(log_button)
     if enabled:
         log_directory = destination.parent / "logs"
         log_directory.mkdir()
         for name in ("app.log", "hid-helper.log", "diagnostic-trace.jsonl"):
             (log_directory / name).write_bytes(b'event\n')
-    QMetaObject.invokeMethod(log_dialog, "accept", Qt.DirectConnection)
+    verdict = _viewmodels.MaintenanceViewModel.saveLogs(log_url)
     for _ in range(60):
         render(window, app, 1)
         if not controller.logExportBusy:
             break
+    assert bool(verdict["ok"]), verdict
     if enabled:
         import zipfile
         assert "已导出 3 个" in controller.statusMessage
@@ -10448,10 +10475,10 @@ for enabled in (False, True):
             assert archive.testzip() is None
     else:
         assert "暂无可导出" in controller.statusMessage
-    # Exercise the real QML click/controller/location helper, replacing only
-    # Explorer so this isolated test never opens a desktop window.
+    # Exercise the real open-location helper, replacing only Explorer so
+    # this isolated test never opens a desktop window.
     with mock.patch.object(m.logging_setup.os, "startfile") as opener:
-        click_item(location_link)
+        _viewmodels.MaintenanceViewModel.openLogs()
         if enabled:
             opener.assert_called_once_with(str(log_directory))
             assert "已打开日志文件夹" in controller.statusMessage
@@ -10464,37 +10491,43 @@ controller._log_export_busy = True
 controller.desktopBehaviorChanged.emit()
 controller.logExportBusyChanged.emit()
 render(window, app, 3)
-assert location_link.property("enabled") and not log_button.property("enabled")
 with mock.patch.object(m.logging_setup.os, "startfile") as opener:
-    click_item(location_link)
+    _viewmodels.MaintenanceViewModel.openLogs()
     opener.assert_called_once_with(str(log_directory))
 controller._log_export_busy = False
 controller.logExportBusyChanged.emit()
 
-state_column = item_geometry(find_child(window, "currentDeviceRow_stateColumn"))
-main_actions = [item_geometry(find_child(window, name)) for name in (
-    "refreshDeviceChecksButton", "openButtonSettingsButton",
-    "bridgeActionButton", "checkApplicationUpdateButton",
-)]
-for action in main_actions[1:]:
-    for edge in ("x", "width", "right"):
-        assert abs(action[edge] - main_actions[0][edge]) <= 0.5
-assert abs(main_actions[0]["x"] - state_column["right"] - 6) <= 0.5
-bluetooth_button = item_geometry(find_child(window, "openBluetoothSettingsButton"))
-assert bluetooth_button["right"] < state_column["x"]
-note_color = find_child(window, "currentDeviceRow_descriptionLabel").property("color")
-for link in (usage_link, log_button, location_link):
-    assert link.property("contentItem").property("color") == note_color
-    assert link.property("background").property("color") is None
+# Link styling (underline, transparent background) lives in the shared
+# CompactLink component the maintenance links use; still verified on the
+# rendered links.
+for link in (privacy_link, speech_link):
     assert link.property("font").underline()
-assert abs(item_geometry(usage_link)["right"] - state_column["right"]) <= 0.5
-assert abs(item_geometry(location_link)["right"] - state_column["right"]) <= 1.1
-assert item_geometry(log_button)["right"] < item_geometry(location_link)["x"]
-assert item_geometry(find_child(window, "diagnosticTraceSwitch"))["right"] == item_geometry(find_child(window, "launchAtLoginSwitch"))["right"]
-if os.environ.get("PROBE_SCREENSHOT_DIR"):
-    window.grabWindow().save(os.path.join(os.environ["PROBE_SCREENSHOT_DIR"], "device-links.png"))
-update_button.forceActiveFocus(Qt.TabFocusReason)
-render(window, app, 3)
+    assert link.property("background").property("color") is None
+
+# Update state machine (the same real backend fields the retired download
+# dialog presented), read through the maintenance update card and action.
+def update_snapshot():
+    card = _viewmodels.MaintenanceViewModel.updateStatus
+    update_item = [
+        row for row in _viewmodels.MaintenanceViewModel.items if row.id == "update"
+    ][0]
+    action = find_child(window, "settingsUpdateActionButton")
+    return {
+        "title": card.title,
+        "subtitle": card.subtitle,
+        "tone": card.tone,
+        "detail": card.detail,
+        "action_label": card.actionLabel,
+        "action_text": str(action.property("text")),
+        "item_status": update_item.status,
+        "item_detail": update_item.detail,
+    }
+
+
+dispatched = []
+controller.downloadApplicationUpdate = lambda: dispatched.append("download")
+controller.checkForApplicationUpdate = lambda: dispatched.append("check")
+controller.openDownloadedApplicationUpdate = lambda: dispatched.append("open")
 
 version = "0.2.0-candidate.16"
 base = f"https://github.com/{u.REPOSITORY_SLUG}/releases/download/test"
@@ -10511,48 +10544,9 @@ controller._background_task_runner = lambda target, _name: target()
 u.claim_daily_update_check = lambda _cache: True
 u.check_for_update = lambda _version: u.ApplicationUpdateCheck(
     u.UpdateCheckOutcome.UPDATE_AVAILABLE, u.parse_application_version(m.__version__), release)
-notices = []
-controller.applicationUpdateNotificationRequested.connect(notices.append)
-startup_timer = find_child(window, "startupUpdateTimer")
-assert startup_timer is not None
-startup_timer.setProperty("interval", 1)
-QMetaObject.invokeMethod(startup_timer, "restart")
-render(window, app, 3)
-assert len(notices) == 1
-assert update_button.property("text") == "查看更新"
-assert find_child(window, "runtimeLogRow_stateLabel").property("text") == "有新版本"
-assert not find_child(window, "applicationUpdateDialog").property("visible")
-QMetaObject.invokeMethod(update_button, "clicked")
-render(window, app)
-
-dialog = find_child(window, "applicationUpdateDialog")
-message = find_child(window, "applicationUpdateMessage")
-version_summary = find_child(window, "applicationUpdateVersionSummary")
-package_summary = find_child(window, "applicationUpdatePackageSummary")
-notes = find_child(window, "applicationUpdateNotes")
-close_button = find_child(window, "closeApplicationUpdateButton")
-release_button = find_child(window, "openApplicationUpdateReleaseButton")
-download_button = find_child(window, "downloadApplicationUpdateButton")
-cancel_button = find_child(window, "cancelApplicationUpdateDownloadButton")
-folder_button = find_child(window, "openDownloadedApplicationUpdateButton")
-progress = find_child(window, "applicationUpdateProgress")
-assert all(item is not None for item in (
-    dialog, message, version_summary, package_summary, notes,
-    close_button, release_button, download_button, cancel_button,
-    folder_button, progress,
-))
-
-available = {
-    "dialog": popup_geometry(dialog),
-    "title": str(dialog.property("title")),
-    "message": str(message.property("text")),
-    "version": str(version_summary.property("text")),
-    "package": str(package_summary.property("text")),
-    "notes": item_geometry(notes),
-    "close": item_geometry(close_button),
-    "release": item_geometry(release_button),
-    "download": item_geometry(download_button),
-}
+assert _viewmodels.AppViewModel.startupSettled()
+render(window, app, 6)
+available = update_snapshot()
 
 controller._application_update_state = "downloading"
 controller._application_update_download_busy = True
@@ -10562,25 +10556,23 @@ controller._application_update_download_received = (
 )
 controller.applicationUpdateChanged.emit()
 render(window, app, 6)
-downloading = {
-    "title": str(dialog.property("title")),
-    "close_visible": bool(close_button.property("visible")),
-    "download_visible": bool(download_button.property("visible")),
-    "cancel": item_geometry(cancel_button),
-    "progress_visible": bool(progress.property("visible")),
-    "progress": float(progress.property("value")),
-}
+downloading = update_snapshot()
+downloading["cancel_visible"] = bool(
+    find_child(window, "settingsCancelUpdateDownloadButton").property("visible")
+)
+dispatched.clear()
+_viewmodels.MaintenanceViewModel.run("update")
+downloading["dispatched"] = list(dispatched)
 
 controller._application_update_state = "download_error"
 controller._application_update_download_busy = False
 controller._application_update_message = "连接 GitHub 超时，请稍后重试。"
 controller.applicationUpdateChanged.emit()
 render(window, app, 6)
-download_error = {
-    "title": str(dialog.property("title")),
-    "download": item_geometry(download_button),
-    "download_text": str(download_button.property("text")),
-}
+download_error = update_snapshot()
+dispatched.clear()
+_viewmodels.MaintenanceViewModel.run("update")
+download_error["dispatched"] = list(dispatched)
 
 controller._application_update_state = "downloaded"
 controller._application_update_available = False
@@ -10588,25 +10580,17 @@ controller._application_update_download_busy = False
 controller._application_update_download_received = (
     controller._application_update_package_size
 )
+controller._application_update_download_path = str(
+    destination.with_name("RemoteMicRC003-update.zip")
+)
 controller._application_update_message = "便携版已下载并通过校验。"
 controller.applicationUpdateChanged.emit()
 render(window, app, 6)
-downloaded = {
-    "title": str(dialog.property("title")),
-    "folder_text": str(folder_button.property("text")),
-    "folder": item_geometry(folder_button),
-    "progress_visible": bool(progress.property("visible")),
-    "progress": float(progress.property("value")),
-}
+downloaded = update_snapshot()
+dispatched.clear()
+_viewmodels.MaintenanceViewModel.run("update")
+downloaded["dispatched"] = list(dispatched)
 
-assert QMetaObject.invokeMethod(
-    dialog, "close", Qt.ConnectionType.DirectConnection
-)
-for _ in range(100):
-    render(window, app, 1)
-    if (not bool(dialog.property("visible"))
-            and bool(update_button.property("activeFocus"))):
-        break
 result = {
     "warnings": [warning.toString() for warning in warnings],
     "window": {
@@ -10615,7 +10599,8 @@ result = {
     },
     "tab_forward": tab_forward,
     "tab_backward": tab_backward,
-    "focus_restored": bool(update_button.property("activeFocus")),
+    "focus_restored": focus_restored,
+    "dialog": remove_dialog_geometry,
     "available": available,
     "downloading": downloading,
     "download_error": download_error,
@@ -11084,439 +11069,10 @@ print(json.dumps(result))
 """
 
 
-_SETTINGS_SHELL_LAYOUT_PROBE_SCRIPT = r"""
-import json
-import os
-
-from PySide6.QtCore import QPointF
-from PySide6.QtTest import QTest
-from ovb_rc003 import qt_settings_app as m
 
 
-def find_child(root, name):
-    children = list(root.children())
-    child_items = getattr(root, "childItems", None)
-    if callable(child_items):
-        children.extend(child for child in child_items() if child not in children)
-    for child in children:
-        if child.objectName() == name:
-            return child
-        found = find_child(child, name)
-        if found is not None:
-            return found
-    return None
 
 
-def render(window, app):
-    for _ in range(12):
-        window.grabWindow()
-        app.processEvents()
-
-
-def bounds(window, name):
-    item = find_child(window, name)
-    assert item is not None, name + " missing"
-    origin = item.mapToScene(QPointF(0, 0))
-    width = float(item.property("width"))
-    height = float(item.property("height"))
-    return {
-        "visible": bool(item.property("visible")),
-        "x": float(origin.x()),
-        "y": float(origin.y()),
-        "width": width,
-        "height": height,
-        "right": float(origin.x()) + width,
-        "bottom": float(origin.y()) + height,
-    }
-
-
-classes = m._load_qt_classes()
-QGuiApplication = classes["QGuiApplication"]
-QQmlApplicationEngine = classes["QQmlApplicationEngine"]
-QQuickStyle = classes["QQuickStyle"]
-QUrl = classes["QUrl"]
-qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
-ButtonMappingModel = classes["ButtonMappingModel"]
-SettingsController = classes["SettingsController"]
-DiagnosticsController = classes["DiagnosticsController"]
-
-QQuickStyle.setStyle(os.environ.get("PROBE_STYLE", "Basic"))
-app = QGuiApplication.instance() or QGuiApplication([])
-bridge_state = {"running": False}
-m.single_instance.bridge_instance_running = lambda: bridge_state["running"]
-model = ButtonMappingModel()
-controller = SettingsController(model)
-diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
-qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
-qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
-qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
-
-engine = QQmlApplicationEngine()
-qml_dir = m._qml_directory()
-engine.addImportPath(str(qml_dir))
-warnings = []
-engine.warnings.connect(lambda values: warnings.extend(values))
-engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
-assert len(engine.rootObjects()) == 1, "main.qml failed to load"
-window = engine.rootObjects()[0]
-window.setWidth(int(os.environ["PROBE_WIDTH"]))
-window.setHeight(int(os.environ["PROBE_HEIGHT"]))
-window.show()
-render(window, app)
-
-tab_bar = find_child(window, "tabBar")
-assert tab_bar is not None
-status_bar = find_child(window, "globalStatusBar")
-status_text = find_child(window, "globalStatusText")
-assert status_bar is not None and status_text is not None
-
-result = {
-    "warnings": [],
-    "width": int(window.property("width")),
-    "height": int(window.property("height")),
-    "initial_status_visible": bool(status_bar.property("visible")),
-    "initial_status_has_status": bool(status_bar.property("hasStatus")),
-    "initial_status_text_visible": bool(status_text.property("visible")),
-    "initial_status_text": str(status_text.property("text")),
-    "navigation": {
-        name: bounds(window, name)
-        for name in (
-            "navigationBar",
-            "connectionTabButton",
-            "mappingTabButton",
-            "permissionsTabButton",
-            "diagnosticsTabButton",
-        )
-    },
-}
-
-tab_bar.setProperty("currentIndex", 0)
-render(window, app)
-connection_names = (
-    "connectionPageContent",
-    "deviceSection",
-    "deviceCombo",
-    "rc003OutputSection",
-    "endpointCombo",
-    "bridgeSection",
-    "bridgeNotRunningWarning",
-    "connectionActionRow",
-    "restoreDefaultsButton",
-    "deviceSaveButton",
-    "saveAndLaunchButton",
-)
-connection_scroll = find_child(window, "connectionScroll")
-result["connection"] = {
-    "items": {name: bounds(window, name) for name in connection_names},
-    "content_width": float(connection_scroll.property("contentWidth")),
-    "available_width": float(connection_scroll.property("availableWidth")),
-    "launch_status": str(find_child(window, "launchStatusText").property("text")),
-    "bridge_warning": str(find_child(window, "bridgeNotRunningWarning").property("text")),
-    "save_highlighted": bool(find_child(window, "deviceSaveButton").property("highlighted")),
-    "launch_highlighted": bool(find_child(window, "saveAndLaunchButton").property("highlighted")),
-}
-
-controller._bridge_launch_elapsed_seconds = 12
-controller.bridgeLaunchElapsedSecondsChanged.emit()
-controller._set_bridge_launch_phase("waiting")
-render(window, app)
-result["connection"]["waiting_progress"] = {
-    "visible": bool(find_child(window, "bridgeLaunchProgress").property("visible")),
-    "indicator_running": bool(
-        find_child(window, "bridgeLaunchBusyIndicator").property("running")
-    ),
-    "stage_text": str(find_child(window, "bridgeLaunchStageText").property("text")),
-    "elapsed_visible": bool(
-        find_child(window, "bridgeLaunchElapsedText").property("visible")
-    ),
-    "elapsed_text": str(find_child(window, "bridgeLaunchElapsedText").property("text")),
-}
-
-controller._set_bridge_launch_phase("connected")
-render(window, app)
-result["connection"]["connected_progress"] = {
-    "visible": bool(find_child(window, "bridgeLaunchProgress").property("visible")),
-    "indicator_running": bool(
-        find_child(window, "bridgeLaunchBusyIndicator").property("running")
-    ),
-    "stage_text": str(find_child(window, "bridgeLaunchStageText").property("text")),
-}
-
-controller._set_launch_status("AUDIT_LAUNCH_RESULT_MUST_BE_VISIBLE")
-render(window, app)
-result["connection"]["explicit_launch_status"] = str(
-    find_child(window, "launchStatusText").property("text")
-)
-
-bridge_timer = find_child(window, "bridgeStatusRefreshTimer")
-assert bridge_timer is not None
-bridge_state["running"] = True
-controller.refreshBridgeState()
-render(window, app)
-result["connection"]["warning_after_external_start"] = str(
-    find_child(window, "bridgeNotRunningWarning").property("text")
-)
-bridge_state["running"] = False
-controller.refreshBridgeState()
-render(window, app)
-result["connection"]["warning_after_external_exit"] = str(
-    find_child(window, "bridgeNotRunningWarning").property("text")
-)
-
-tab_bar.setProperty("currentIndex", 1)
-render(window, app)
-mapping_names = (
-    "rc003MappingLayout",
-    "mappingActionsPanel",
-    "mappingList",
-    "mappingLines",
-    "activeMappingLine",
-    "leftMappingCards",
-    "photoSidebar",
-    "rightMappingCards",
-        "mappingListFrame",
-        "detectRealKeyButton",
-        "restoreMappingDefaultsButton",
-        "editMapping_power",
-        "editMapping_tv",
-)
-result["mapping"] = {
-    "items": {name: bounds(window, name) for name in mapping_names},
-}
-
-tab_bar.setProperty("currentIndex", 2)
-render(window, app)
-permissions_names = (
-    "permissionsPageContent",
-    "requiredPermissionsSection",
-    "openBluetoothSettingsButton",
-    "openMicrophonePrivacyButton",
-    "openSoundInputSettingsButton",
-)
-permissions_scroll = find_child(window, "permissionsScroll")
-result["permissions"] = {
-    "items": {name: bounds(window, name) for name in permissions_names},
-    "content_width": float(permissions_scroll.property("contentWidth")),
-    "available_width": float(permissions_scroll.property("availableWidth")),
-}
-
-tab_bar.setProperty("currentIndex", 3)
-render(window, app)
-diagnostics_names = (
-    "diagnosticsPageContent",
-    "refreshButton",
-    "optionalDriverSection",
-    "optionalDriverDescription",
-    "selectCableInputButton",
-    "launchDriverSetupButton",
-    "vbCableChannelTestSection",
-    "vbCableChannelDescription",
-    "testVbCableChannelButton",
-    "diagnosticsFooterSection",
-    "diagnosticsFooterDescription",
-    "openSpeechSettingsButton",
-    "diagnosticsOpenLogButton",
-)
-diagnostics_scroll = find_child(window, "diagnosticsScroll")
-result["diagnostics"] = {
-    "items": {name: bounds(window, name) for name in diagnostics_names},
-    "content_width": float(diagnostics_scroll.property("contentWidth")),
-    "available_width": float(diagnostics_scroll.property("availableWidth")),
-    "content_height": float(diagnostics_scroll.property("contentHeight")),
-    "available_height": float(diagnostics_scroll.property("availableHeight")),
-}
-
-diagnostics_controller._check_rows = [
-    {
-        "checkId": "audit_refresh",
-        "title": "刷新测试",
-        "group": "ordinary_buttons",
-        "status": "pass",
-        "detail": "AUDIT_DETAIL_FIRST",
-    }
-]
-diagnostics_controller.checkResultsChanged.emit()
-render(window, app)
-diagnostic_result = find_child(window, "diagnosticResult_audit_refresh")
-assert diagnostic_result is not None
-result["diagnostics"]["detail_before_refresh"] = str(
-    diagnostic_result.property("detailText")
-)
-
-diagnostics_controller._check_rows = [
-    {
-        "checkId": "audit_refresh",
-        "title": "刷新测试",
-        "group": "ordinary_buttons",
-        "status": "fail",
-        "detail": "AUDIT_DETAIL_AFTER_REFRESH",
-    }
-]
-diagnostics_controller.checkResultsChanged.emit()
-render(window, app)
-diagnostic_result = find_child(window, "diagnosticResult_audit_refresh")
-assert diagnostic_result is not None
-result["diagnostics"]["detail_after_refresh"] = str(
-    diagnostic_result.property("detailText")
-)
-
-controller._set_status_message("neutral status")
-render(window, app)
-result["neutral_status"] = {
-    "visible": bool(status_bar.property("visible")),
-    "text": str(status_text.property("text")),
-}
-controller._set_error_message("priority error")
-render(window, app)
-result["error_status"] = {
-    "visible": bool(status_bar.property("visible")),
-    "text": str(status_text.property("text")),
-}
-result["warnings"] = [warning.toString() for warning in warnings]
-
-controller.shutdownBackgroundTasks()
-m._shutdown_diagnostics_workers()
-print(json.dumps(result))
-"""
-
-
-_TAB_FOCUS_SCROLL_PROBE_SCRIPT = r"""
-import json
-
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtTest import QTest
-from ovb_rc003 import qt_settings_app as m
-
-
-def find_child(root, name):
-    children = list(root.children())
-    child_items = getattr(root, "childItems", None)
-    if callable(child_items):
-        children.extend(child for child in child_items() if child not in children)
-    for child in children:
-        if child.objectName() == name:
-            return child
-        found = find_child(child, name)
-        if found is not None:
-            return found
-    return None
-
-
-def render(window, app):
-    for _ in range(10):
-        window.grabWindow()
-        app.processEvents()
-
-
-def tab_to(window, app, target, limit=20):
-    for _ in range(limit):
-        if bool(target.property("activeFocus")):
-            return True
-        QTest.keyClick(window, Qt.Key_Tab)
-        render(window, app)
-    return bool(target.property("activeFocus"))
-
-
-def navigation_has_focus(window):
-    return any(
-        bool(find_child(window, name).property("activeFocus"))
-        for name in (
-            "connectionTabButton",
-            "mappingTabButton",
-            "permissionsTabButton",
-            "diagnosticsTabButton",
-        )
-    )
-
-
-def visible_in_window(item, window):
-    origin = item.mapToScene(QPointF(0, 0))
-    return (
-        origin.y() >= 0
-        and origin.y() + float(item.property("height")) <= float(window.property("height"))
-    )
-
-
-classes = m._load_qt_classes()
-QGuiApplication = classes["QGuiApplication"]
-QQmlApplicationEngine = classes["QQmlApplicationEngine"]
-QQuickStyle = classes["QQuickStyle"]
-QUrl = classes["QUrl"]
-qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
-ButtonMappingModel = classes["ButtonMappingModel"]
-SettingsController = classes["SettingsController"]
-DiagnosticsController = classes["DiagnosticsController"]
-
-QQuickStyle.setStyle("Basic")
-app = QGuiApplication.instance() or QGuiApplication([])
-model = ButtonMappingModel()
-controller = SettingsController(model)
-diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
-qmlRegisterSingletonInstance(SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller)
-qmlRegisterSingletonInstance(ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model)
-qmlRegisterSingletonInstance(DiagnosticsController, "OvbRc003Settings", 1, 0, "DiagnosticsController", diagnostics_controller)
-
-engine = QQmlApplicationEngine()
-qml_dir = m._qml_directory()
-engine.addImportPath(str(qml_dir))
-warnings = []
-engine.warnings.connect(lambda values: warnings.extend(values))
-engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
-assert len(engine.rootObjects()) == 1, "main.qml failed to load"
-window = engine.rootObjects()[0]
-window.setWidth(640)
-window.setHeight(480)
-window.show()
-render(window, app)
-
-tab_bar = find_child(window, "tabBar")
-tab_bar.setProperty("currentIndex", 0)
-render(window, app)
-connection_scroll = find_child(window, "connectionScroll")
-connection_flickable = connection_scroll.property("contentItem")
-connection_flickable.setProperty("contentY", 0)
-endpoint = find_child(window, "endpointCombo")
-launch = find_child(window, "saveAndLaunchButton")
-endpoint.forceActiveFocus(Qt.TabFocusReason)
-render(window, app)
-connection_reached = tab_to(window, app, launch)
-QTest.keyClick(window, Qt.Key_Tab)
-render(window, app)
-connection_escaped = not bool(launch.property("activeFocus")) and navigation_has_focus(window)
-
-tab_bar.setProperty("currentIndex", 2)
-render(window, app)
-permissions_scroll = find_child(window, "permissionsScroll")
-permissions_flickable = permissions_scroll.property("contentItem")
-permissions_flickable.setProperty("contentY", 0)
-microphone = find_child(window, "openMicrophonePrivacyButton")
-sound_button = find_child(window, "openSoundInputSettingsButton")
-microphone.forceActiveFocus(Qt.TabFocusReason)
-render(window, app)
-permissions_reached = tab_to(window, app, sound_button)
-QTest.keyClick(window, Qt.Key_Tab)
-render(window, app)
-permissions_escaped = not bool(sound_button.property("activeFocus")) and navigation_has_focus(window)
-
-result = {
-    "warnings": [warning.toString() for warning in warnings],
-    "connection": {
-        "reached": connection_reached,
-        "escaped": connection_escaped,
-        "content_y": float(connection_flickable.property("contentY")),
-        "target_visible": visible_in_window(launch, window),
-    },
-    "permissions": {
-        "reached": permissions_reached,
-        "escaped": permissions_escaped,
-        "content_y": float(permissions_flickable.property("contentY")),
-        "target_visible": visible_in_window(sound_button, window),
-    },
-}
-controller.shutdownBackgroundTasks()
-m._shutdown_diagnostics_workers()
-print(json.dumps(result))
-"""
 
 
 _SELECTION_COMBO_STATE_PROBE_SCRIPT = r"""
@@ -11671,6 +11227,10 @@ try:
         # Keep the real page, controller and model-reset signals together.
         for instance, name in ((controller, "SettingsController"), (model, "ButtonMappingModel"), (diagnostics, "DiagnosticsController")):
             qmlRegisterSingletonInstance(type(instance), "OvbRc003Settings", 1, 0, name, instance)
+        from ovb_rc003.presentation import registry
+        _viewmodels = registry.register(
+            controller=controller, mapping_model=model, diagnostics=diagnostics
+        )
         engine = QQmlEngine()
         component = QQmlComponent(engine)
         component.setData(b'''import QtQuick
@@ -11678,7 +11238,7 @@ import QtQuick.Controls
 ApplicationWindow {
     visible: true; width: 760; height: 900
     Tokens { id: theme }
-    VoicePage { anchors.fill: parent; tokens: theme }
+    SettingsPanel { anchors.fill: parent; tokens: theme }
 }''', QUrl.fromLocalFile(str(m._qml_directory() / "OutputEndpointRefreshProbe.qml")))
         assert component.isReady(), [error.toString() for error in component.errors()]
         window = component.create()
@@ -11696,8 +11256,12 @@ ApplicationWindow {
                     return found
             return None
 
-        combo = find(window, "endpointCombo")
-        assert combo is not None
+        settings_voice_section = find(window, "settingsVoiceSection")
+        assert settings_voice_section is not None
+        settings_voice_section.setProperty("folded", False)
+        for _ in range(4):
+            app.processEvents()
+            window.grabWindow()
         results = []
 
         def check(label, index, name):
@@ -11705,9 +11269,14 @@ ApplicationWindow {
                 app.processEvents()
                 window.grabWindow()
             assert controller.selectedEndpointIndex == index, label
-            assert combo.property("currentIndex") == index, (label, combo.property("currentText"))
-            expected_text = controller.endpointOptions[index] if index >= 0 else ""
-            assert combo.property("currentText") == expected_text, label
+            rows = list(_viewmodels.VoiceViewModel.outputEndpoints)
+            selected = [row for row in rows if row.selected]
+            if index >= 0:
+                assert len(selected) == 1, (label, [row.label for row in rows])
+                assert selected[0].id == str(index), label
+                assert selected[0].label == controller.endpointOptions[index], label
+            else:
+                assert not selected, (label, [row.label for row in rows])
             assert config.load_config(config.config_path())["output_endpoint_name"] == name, label
             results.append(label)
 
@@ -11736,21 +11305,21 @@ ApplicationWindow {
         check("unselected_model_changed", -1, "")
         preflight.assert_not_called()
 
-        # Exercise the real control's keyboard activation and rollback binding.
+        # Exercise the real selection slot the endpoint rows forward to, and
+        # its preflight/rollback binding.
         enumerate_endpoints.return_value = [line, cable]
         controller._request_endpoint_options_refresh()
-        combo.forceActiveFocus()
-        QTest.keyClick(window, Qt.Key_End)
+        _viewmodels.VoiceViewModel.selectOutput("1")
         check("user_saved", 1, cable.name)
         assert preflight.call_count == 1
         preflight.side_effect = audio_output.AudioOutputUnavailableError("unavailable")
-        QTest.keyClick(window, Qt.Key_Up)
+        _viewmodels.VoiceViewModel.selectOutput("0")
         check("open_failed", 1, cable.name)
         assert preflight.call_count == 2
         assert controller.errorMessage
         preflight.side_effect = None
         with mock.patch.object(config, "save_config", side_effect=OSError("disk full")):
-            QTest.keyClick(window, Qt.Key_Up)
+            _viewmodels.VoiceViewModel.selectOutput("0")
             check("save_failed", 1, cable.name)
         assert preflight.call_count == 3
         assert "无法写入" in controller.errorMessage
@@ -12070,147 +11639,104 @@ print(json.dumps(result))
 class SettingsShellSourceContractTests(unittest.TestCase):
     def setUp(self):
         qml_dir = Path(qt_settings_app.__file__).resolve().parent / "qml"
-        self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
-        self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
-        self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
-        self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(
-            encoding="utf-8"
+        self.qml_dir = qml_dir
+
+        def load(name):
+            return (qml_dir / name).read_text(encoding="utf-8")
+
+        self.main_qml = load("main.qml")
+        self.home_qml = load("HomePanel.qml")
+        self.keys_qml = load("KeysPanel.qml")
+        self.settings_qml = load("SettingsPanel.qml")
+        self.fold_section_qml = load("FoldSection.qml")
+        self.section_frame_qml = load("SectionFrame.qml")
+        self.form_field_qml = load("FormField.qml")
+        self.ui_label_qml = load("UiLabel.qml")
+        self.battery_gauge_qml = load("BatteryGauge.qml")
+        self.selection_combo_qml = load("SelectionComboBox.qml")
+        self.nav_button_qml = load("NavButton.qml")
+        self.dialog_close_button_qml = load("DialogCloseButton.qml")
+        self.icon_glyph_qml = load("IconGlyph.qml")
+        self.inline_settings_row_qml = load("InlineSettingsRow.qml")
+        self.mapping_card_qml = load("MappingCard.qml")
+        self.mapping_key_label_qml = load("MappingKeyLabel.qml")
+        self.tokens_qml = load("Tokens.qml")
+        self.compact_button_qml = load("CompactButton.qml")
+        self.compact_tooltip_qml = load("CompactToolTip.qml")
+        self.settings_list_row_qml = load("SettingsListRow.qml")
+        self.settings_section_title_qml = load("SettingsSectionTitle.qml")
+        self.diagnostic_result_row_qml = load("DiagnosticResultRow.qml")
+        self.settings_dialog_qml = load("SettingsDialog.qml")
+        self.view_qml = "\n".join(
+            load(name) for name in sorted(p.name for p in qml_dir.glob("*.qml"))
         )
-        self.section_frame_qml = (qml_dir / "SectionFrame.qml").read_text(
-            encoding="utf-8"
+        self.panel_qml = "\n".join(
+            (self.main_qml, self.home_qml, self.keys_qml, self.settings_qml)
         )
-        self.form_field_qml = (qml_dir / "FormField.qml").read_text(
-            encoding="utf-8"
-        )
-        self.ui_label_qml = (qml_dir / "UiLabel.qml").read_text(
-            encoding="utf-8"
-        )
-        self.battery_gauge_qml = (qml_dir / "BatteryGauge.qml").read_text(
-            encoding="utf-8"
-        )
-        self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
-            encoding="utf-8"
-        )
-        self.nav_button_qml = (qml_dir / "NavButton.qml").read_text(
-            encoding="utf-8"
-        )
-        self.dialog_close_button_qml = (qml_dir / "DialogCloseButton.qml").read_text(
-            encoding="utf-8"
-        )
-        self.icon_glyph_qml = (qml_dir / "IconGlyph.qml").read_text(
-            encoding="utf-8"
-        )
-        self.inline_settings_row_qml = (qml_dir / "InlineSettingsRow.qml").read_text(
-            encoding="utf-8"
-        )
-        self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
-            encoding="utf-8"
-        )
-        self.mapping_key_label_qml = (qml_dir / "MappingKeyLabel.qml").read_text(
-            encoding="utf-8"
-        )
-        self.tokens_qml = (qml_dir / "Tokens.qml").read_text(encoding="utf-8")
-        self.compact_button_qml = (qml_dir / "CompactButton.qml").read_text(
-            encoding="utf-8"
-        )
-        self.compact_tooltip_qml = (qml_dir / "CompactToolTip.qml").read_text(
-            encoding="utf-8"
-        )
-        self.settings_list_row_qml = (qml_dir / "SettingsListRow.qml").read_text(
-            encoding="utf-8"
-        )
-        self.settings_section_title_qml = (
-            qml_dir / "SettingsSectionTitle.qml"
-        ).read_text(encoding="utf-8")
-        self.diagnostic_result_row_qml = (
-            qml_dir / "DiagnosticResultRow.qml"
-        ).read_text(encoding="utf-8")
 
     def test_settings_feedback_has_one_global_owner(self):
+        self.assertEqual(self.view_qml.count('objectName: "globalStatusBar"'), 1)
         self.assertIn('objectName: "globalStatusBar"', self.main_qml)
-        self.assertIn(
-            "SettingsController.activePageIndex = currentIndex",
-            self.main_qml,
-        )
+        self.assertIn("text: AppViewModel.bridgeStateLabel", self.main_qml)
+        for panel_text in (self.home_qml, self.keys_qml, self.settings_qml):
+            self.assertNotIn('objectName: "globalStatusBar"', panel_text)
+            self.assertNotIn("SettingsController.errorMessage", panel_text)
+            self.assertNotIn("SettingsController.statusMessage", panel_text)
+        self.assertIn("currentIndex: AppViewModel.currentPage", self.main_qml)
+        self.assertNotIn("activePageIndex", self.view_qml)
 
     def test_xiaomi_battery_gauge_is_passive_and_anchored_to_sidebar_bottom(self):
-        self.assertIn('objectName: "remoteBatteryGauge"', self.main_qml)
-        self.assertIn("anchors.bottom: parent.bottom", self.main_qml)
-        self.assertIn("visible: SettingsController.isRc003Device", self.main_qml)
-        self.assertIn("level: SettingsController.remoteBatteryLevel", self.main_qml)
-        self.assertIn("implicitWidth: 28", self.battery_gauge_qml)
-        self.assertIn("implicitHeight: 28", self.battery_gauge_qml)
+        self.assertIn('objectName: "homeFacetBattery"', self.home_qml)
+        self.assertIn('labelText: qsTr("电量")', self.home_qml)
+        self.assertIn("valueText: DeviceViewModel.batteryLabel", self.home_qml)
+        for source in (self.main_qml, self.home_qml, self.keys_qml, self.settings_qml):
+            self.assertNotIn("BatteryGauge {", source)
+        self.assertIn("implicitWidth: 28 * sizeScale", self.battery_gauge_qml)
+        self.assertIn("implicitHeight: 28 * sizeScale", self.battery_gauge_qml)
         self.assertIn(
             "strokeWidth = root.tokens.structuralDividerWidth * 2",
             self.battery_gauge_qml,
         )
-        self.assertIn("font.pixelSize: root.tokens.fontSizeSmall", self.battery_gauge_qml)
+        self.assertIn(
+            "font.pixelSize: root.tokens.fontSizeSmall * root.sizeScale",
+            self.battery_gauge_qml,
+        )
         self.assertIn("horizontalAlignment: Text.AlignHCenter", self.battery_gauge_qml)
         self.assertIn("verticalAlignment: Text.AlignVCenter", self.battery_gauge_qml)
         self.assertIn("totalAngle = 5 * Math.PI / 3", self.battery_gauge_qml)
         self.assertIn('root.available ? String(root.level) : "—"', self.battery_gauge_qml)
-        for interactive_surface in ("MouseArea", "HoverHandler", "ToolTip"):
+        self.assertIn("activeFocusOnTab: false", self.battery_gauge_qml)
+        for interactive_surface in ("MouseArea", "HoverHandler", "ToolTip", "TapHandler"):
             self.assertNotIn(interactive_surface, self.battery_gauge_qml)
 
     def test_hid_helper_repair_is_scoped_to_the_button_receiver_row(self):
-        self.assertIn('objectName: "buttonReceiverRow"', self.device_qml)
-        self.assertIn('objectName: "repairHidHelperButton"', self.device_qml)
-        self.assertIn("root.enableHidHelperRequested()", self.device_qml)
-        self.assertIn("SettingsController.repairHidHelper()", self.main_qml)
-        self.assertIn("SettingsController.hidHelperRepairVisible", self.device_qml)
-        self.assertIn("SettingsController.hidHelperSetupRequired", self.device_qml)
-        self.assertIn("SettingsController.hidHelperCleanupPending", self.device_qml)
-        self.assertIn("SettingsController.hidHelperAccountUnsupported", self.device_qml)
-        self.assertIn("启用改键", self.device_qml)
-        self.assertIn("完成清理", self.device_qml)
-        self.assertIn(
-            'case "disabled": return qsTr("点击“启用改键”")',
-            self.device_qml,
+        self.assertEqual(
+            self.view_qml.count('objectName: "settingsRemoveHelperButton"'), 1
         )
-        self.assertIn('case "account": return qsTr("请更换账号")', self.device_qml)
+        maintenance_index = self.settings_qml.index(
+            'objectName: "settingsMaintenanceSection"'
+        )
+        remove_button_index = self.settings_qml.index(
+            'objectName: "settingsRemoveHelperButton"'
+        )
+        self.assertLess(maintenance_index, remove_button_index)
+        self.assertIn('title: qsTr("移除按键映射权限？")', self.settings_qml)
         self.assertIn(
-            'case "permission": return qsTr("点击“修复权限”")',
-            self.device_qml,
+            "移除后，本机所有无线麦版本都不能使用自定义按键映射",
+            self.settings_qml,
         )
         self.assertIn(
-            'case "version": return qsTr("请安装兼容版")',
-            self.device_qml,
+            "onAccepted: MaintenanceViewModel.removeHelper()", self.settings_qml
         )
-        self.assertIn('objectName: "hidHelperSetupDialog"', self.main_qml)
-        self.assertIn(
-            "建议打开管理员按键权限",
-            self.main_qml,
+        remove_dialog = self.settings_qml[
+            self.settings_qml.index("id: removeHelperDialog"):
+            self.settings_qml.index("onAccepted: MaintenanceViewModel.removeHelper()")
+        ]
+        self.assertIn("standardButtons: Dialog.Ok | Dialog.Cancel", remove_dialog)
+        self.assertEqual(
+            self.settings_qml.count("MaintenanceViewModel.run(modelData.id)"), 1
         )
-        self.assertIn("用于自定义改键和遥控器语音键", self.main_qml)
-        self.assertIn("成功后普通启动和自启动不再询问", self.main_qml)
-        self.assertIn("现在不打开时，只保留 Windows 原始按键", self.main_qml)
-        self.assertIn("修复管理员按键权限？", self.main_qml)
-        self.assertIn("修复后恢复自定义改键和遥控器语音键", self.main_qml)
-        self.assertIn('? qsTr("不打开") : qsTr("取消")', self.main_qml)
-        self.assertIn("flat: SettingsController.hidHelperSetupRequired", self.main_qml)
-        self.assertIn('? qsTr("打开") : qsTr("修复")', self.main_qml)
-        self.assertIn("root.flat", self.compact_button_qml)
-        self.assertIn("root.flat && root.activeFocus", self.compact_button_qml)
-        self.assertIn("自定义按键映射已可用。确认管理员权限，清理旧组件。", self.main_qml)
-        self.assertIn('objectName: "removeHidHelperButton"', self.device_qml)
-        self.assertIn("本机所有无线麦版本都不能使用自定义按键映射", self.main_qml)
-        self.assertIn(
-            "SettingsController.feedbackPageIndex === tabBar.currentIndex",
-            self.main_qml,
-        )
-        self.assertIn(
-            "tabBar.currentIndex === 1 && SettingsController.mappingDirty",
-            self.main_qml,
-        )
-        for page_text in (
-            self.device_qml,
-            self.voice_qml,
-            self.buttons_qml,
-        ):
-            self.assertNotIn("SettingsController.errorMessage", page_text)
-            self.assertNotIn("SettingsController.statusMessage", page_text)
-
-        self.assertIn("保留右下角图标；关闭此项则完全退出", self.device_qml)
+        self.assertIn('text: qsTr("通用设置")', self.settings_qml)
 
     def test_touched_pages_reuse_shared_compact_sources(self):
         self.assertIn("default property alias contentData", self.section_frame_qml)
@@ -12218,15 +11744,18 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         for kind in ("bodyKind", "noteKind", "sectionTitleKind", "pageTitleKind"):
             self.assertIn(kind, self.ui_label_qml)
 
-        for page_text in (
-            self.device_qml,
-            self.voice_qml,
+        self.assertIn("SectionFrame {", self.home_qml)
+        self.assertIn("SectionFrame {", self.fold_section_qml)
+        for shared_use in (
+            "FoldSection {",
+            "FormField {",
+            "SettingsListRow {",
+            "InlineSettingsRow {",
+            "SelectionComboBox {",
+            "CompactTextField {",
         ):
-            self.assertIn("SectionFrame {", page_text)
-            self.assertIn("InlineSettingsRow {", page_text)
+            self.assertIn(shared_use, self.settings_qml)
 
-        self.assertIn("SelectionComboBox {", self.voice_qml)
-        self.assertIn("CompactTextField {", self.voice_qml)
         self.assertIn(
             "property string descriptionObjectName", self.inline_settings_row_qml
         )
@@ -12240,7 +11769,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("default property alias actionData", self.inline_settings_row_qml)
         self.assertIn("AbstractButton {", self.mapping_card_qml)
         self.assertIn("implicitHeight: 49", self.mapping_card_qml)
-        self.assertNotIn("mappingCardHeight", self.buttons_qml)
+        self.assertNotIn("mappingCardHeight", self.keys_qml)
 
     def test_settings_card_section_titles_share_one_compact_style(self):
         self.assertIn("kind: bodyKind", self.settings_section_title_qml)
@@ -12257,19 +11786,18 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "Layout.bottomMargin: tokens.spacingSmall",
             self.settings_section_title_qml,
         )
-        self.assertEqual(self.device_qml.count("SettingsSectionTitle {"), 2)
-        self.assertEqual(self.voice_qml.count("SettingsSectionTitle {"), 3)
+        self.assertEqual(self.settings_qml.count("SettingsSectionTitle {"), 8)
+        self.assertEqual(self.home_qml.count("SettingsSectionTitle {"), 0)
+        self.assertEqual(self.keys_qml.count("SettingsSectionTitle {"), 0)
         for object_name in (
-            "devicePrerequisiteSectionTitle",
-            "desktopBehaviorSectionTitle",
+            "settingsDeviceSection",
+            "settingsVoiceSection",
+            "settingsMappingSection",
+            "settingsMaintenanceSection",
         ):
-            self.assertIn(f'objectName: "{object_name}"', self.device_qml)
-        for object_name in (
-            "audioPrerequisiteSectionTitle",
-            "voiceProgramSectionTitle",
-            "voiceTestSectionTitle",
-        ):
-            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+            self.assertIn(f'objectName: "{object_name}"', self.settings_qml)
+        for title in ("设备", "语音", "按键", "维护"):
+            self.assertIn(f'titleText: qsTr("{title}")', self.settings_qml)
 
     def test_single_mapping_uses_the_shared_key_title(self):
         self.assertIn(
@@ -12278,15 +11806,16 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         )
         self.assertIn("font.weight: Font.Medium", self.mapping_key_label_qml)
         self.assertEqual(self.mapping_card_qml.count("MappingKeyLabel {"), 1)
-        self.assertEqual(self.buttons_qml.count("MappingKeyLabel {"), 0)
+        self.assertEqual(self.keys_qml.count("MappingKeyLabel {"), 0)
         self.assertNotIn("comboMapping", self.tokens_qml)
 
     def test_all_selectors_reuse_one_selected_option_delegate(self):
-        self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 4)
-        self.assertIn(
-            "recommendedIndex: SettingsController.recommendedEndpointIndex",
-            self.voice_qml,
-        )
+        import re
+
+        self.assertEqual(self.settings_qml.count("SelectionComboBox {"), 2)
+        self.assertEqual(self.home_qml.count("SelectionComboBox {"), 0)
+        self.assertEqual(self.keys_qml.count("SelectionComboBox {"), 0)
+        self.assertIsNone(re.search(r"(?<!Selection)ComboBox\s*\{", self.panel_qml))
         self.assertIn(
             "font.weight: index === root.effectiveIndex ? Font.DemiBold : Font.Normal",
             self.selection_combo_qml,
@@ -12296,122 +11825,99 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("recommendedIndex >= 0 && index >= 0", self.selection_combo_qml)
         self.assertIn('qsTr("（推荐）")', self.selection_combo_qml)
         self.assertIn("displayText: decoratedText(currentIndex, currentText)", self.selection_combo_qml)
-        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 0)
-        self.assertNotIn("SettingsController.comboModifierOptions", self.buttons_qml)
-        self.assertIn(
-            "model: SettingsController.voiceProgramOptions",
-            self.voice_qml,
-        )
+        self.assertIn("showEffectiveMarker: true", self.settings_qml)
 
     def test_log_export_has_one_formal_entry_point(self):
-        self.assertNotIn("SettingsController.exportLogs(", self.voice_qml)
-        self.assertNotIn("SettingsController.exportLogs(", self.buttons_qml)
         self.assertEqual(
-            self.device_qml.count("SettingsController.exportLogs(selectedFile)"),
-            1,
+            self.settings_qml.count("MaintenanceViewModel.run(modelData.id)"), 1
         )
-        self.assertIn('fileMode: FileDialog.SaveFile', self.device_qml)
-        self.assertIn('qsTr("导出日志")', self.device_qml)
-        self.assertIn('titleText: qsTr("诊断日志")', self.device_qml)
-        self.assertEqual(self.device_qml.count('SettingsController.openLogLocation()'), 1)
-        self.assertIn('text: qsTr("打开日志位置")', self.device_qml)
+        self.assertEqual(self.settings_qml.count("MaintenanceViewModel.run("), 2)
+        for direct_call in (
+            "exportLogs",
+            "saveLogs",
+            "openLogs",
+            "logExportDefaultFile",
+        ):
+            self.assertNotIn(direct_call, self.view_qml)
 
     def test_device_start_and_virtual_audio_apply_keep_distinct_commands(self):
-        self.assertIn("SettingsController.startBridge()", self.device_qml)
-        self.assertNotIn("SettingsController.saveSettings()", self.device_qml)
+        self.assertEqual(self.view_qml.count("DeviceViewModel.bridgeAction()"), 1)
         self.assertIn(
-            "SettingsController.selectAndPersistOutputEndpointIndex(",
-            self.voice_qml,
+            "onClicked: root.showFeedback(DeviceViewModel.bridgeAction())",
+            self.settings_qml,
         )
-        self.assertNotIn("SettingsController.saveSettings()", self.voice_qml)
-        self.assertIn("连接遥控器，接收按键和语音", self.device_qml)
-        self.assertNotIn(
-            "descriptionText: SettingsController.launchStatusText", self.device_qml
+        self.assertEqual(
+            self.view_qml.count("VoiceViewModel.selectOutput(modelData.id)"), 1
         )
-        self.assertNotIn("saveAndLaunch", self.device_qml)
-        self.assertNotIn("stopBridge", self.device_qml)
+        self.assertIn("text: DeviceViewModel.connectionCard.detail", self.settings_qml)
+        for forbidden in (
+            "saveSettings",
+            "saveAndLaunch",
+            "stopBridge",
+            "launchStatusText",
+        ):
+            self.assertNotIn(forbidden, self.view_qml)
 
     def test_diagnostics_keep_details_in_the_rows_that_use_them(self):
-        self.assertIn("function currentDeviceDetailText()", self.device_qml)
-        self.assertIn("让遥控器按键在电脑上生效", self.device_qml)
-        self.assertIn("function checkDetail(checkId, fallback)", self.voice_qml)
-        for check_id in ("ble_candidate", "os_version", "raw_input"):
-            self.assertIn(f'"{check_id}"', self.device_qml)
-        for check_id in ("vb_cable_endpoints", "output_endpoint"):
-            self.assertIn(f'"{check_id}"', self.voice_qml)
-        self.assertNotIn('checkState("dictation")', self.voice_qml)
+        self.assertEqual(self.settings_qml.count("DiagnosticResultRow {"), 2)
+        self.assertEqual(self.settings_qml.count("titleText: modelData.title"), 2)
+        self.assertEqual(
+            self.settings_qml.count(
+                "statusText: root.checkStatusLabel(modelData.status)"
+            ),
+            2,
+        )
+        self.assertEqual(self.settings_qml.count("detailText: modelData.detail"), 5)
+        for source in (self.home_qml, self.keys_qml, self.settings_qml):
+            self.assertNotIn("function checkDetail", source)
+            self.assertNotIn("function currentDeviceDetailText", source)
+            self.assertNotIn('checkState("dictation")', source)
+        for check_id in (
+            "ble_candidate",
+            "os_version",
+            "raw_input",
+            "vb_cable_endpoints",
+            "output_endpoint",
+        ):
+            self.assertNotIn(f'"{check_id}"', self.view_qml)
 
     def test_diagnostics_exposes_loopback_as_an_explicit_nonautomatic_action(self):
-        self.assertIn('objectName: "soundChannelTestRow"', self.voice_qml)
-        self.assertIn('objectName: "testVbCableChannelButton"', self.voice_qml)
-        self.assertIn(
-            "DiagnosticsController.testVbCableChannelWithBridgeRestart()",
-            self.voice_qml,
-        )
-        self.assertIn("DiagnosticsController.vbCableTestRunning", self.voice_qml)
-        self.assertIn('objectName: "bridgeTestConfirmDialog"', self.voice_qml)
-        self.assertGreaterEqual(
-            self.voice_qml.count("!root.configurationWriteBusy"),
-            2,
+        self.assertEqual(self.view_qml.count('objectName: "settingsTestAudioButton"'), 1)
+        self.assertEqual(self.view_qml.count("VoiceViewModel.testAudio()"), 1)
+        self.assertIn('qsTr("检查声音通路")', self.settings_qml)
+        self.assertIn('objectName: "settingsInstallVirtualCableButton"', self.settings_qml)
+        self.assertEqual(self.view_qml.count("VoiceViewModel.installVirtualCable()"), 1)
+        button_index = self.settings_qml.index('objectName: "settingsTestAudioButton"')
+        call_index = self.settings_qml.index("VoiceViewModel.testAudio()")
+        self.assertLess(button_index, call_index)
+        self.assertNotIn(
+            "Component.onCompleted: VoiceViewModel.testAudio()", self.view_qml
         )
 
     def test_service_state_has_one_formal_device_page_location(self):
-        self.assertIn('objectName: "remoteServiceRow"', self.device_qml)
-        self.assertEqual(self.device_qml.count('objectName: "bridgeActionButton"'), 1)
-        self.assertNotIn('objectName: "restartBridgeButton"', self.device_qml)
-        self.assertNotIn('objectName: "startBridgeButton"', self.device_qml)
-        self.assertIn(
-            "SettingsController.bridgeRestartRecommended",
-            self.device_qml,
-        )
-        self.assertIn("SettingsController.restartBridge()", self.device_qml)
-        self.assertIn("SettingsController.reconnectBridgeNow()", self.device_qml)
-        self.assertIn("SettingsController.bridgeReconnectAvailable", self.device_qml)
-        self.assertIn('return qsTr("重新连接")', self.device_qml)
-        self.assertIn('return qsTr("重启服务")', self.device_qml)
-        self.assertIn('return qsTr("点击“重启服务”")', self.device_qml)
-        self.assertIn('return qsTr("已连接")', self.device_qml)
-        self.assertIn('case "waiting_remote": return qsTr("未连接")', self.device_qml)
-        self.assertNotIn("请按遥控器方向键", self.device_qml)
-        self.assertIn('return qsTr("点击“重新连接”")', self.device_qml)
-        self.assertNotIn('qsTr("确认中")', self.device_qml)
-        self.assertNotIn('return qsTr("等待连接")', self.device_qml)
-        self.assertIn("function bridgeNeedsRestartAction()", self.device_qml)
-        self.assertIn("SettingsController.buttonReceiverUsable", self.device_qml)
-        self.assertIn("if (buttonReceiverWaitsForRemote())", self.device_qml)
-        self.assertNotIn("hidTapWaitsForFirstInput", self.device_qml)
-        self.assertNotIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
-        self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
-        self.assertIn("SettingsController.bridgeRunning", self.device_qml)
-        self.assertIn('return qsTr("点击“启动服务”")', self.device_qml)
-        self.assertNotIn("语音和真实按键检测不可用", self.buttons_qml)
+        self.assertEqual(self.view_qml.count('objectName: "settingsBridgeActionButton"'), 1)
+        self.assertEqual(self.view_qml.count("DeviceViewModel.bridgeAction()"), 1)
+        for duplicate in (
+            'objectName: "restartBridgeButton"',
+            'objectName: "startBridgeButton"',
+            'objectName: "bridgeActionButton"',
+        ):
+            self.assertNotIn(duplicate, self.view_qml)
+        for binding in ("title", "subtitle", "detail", "actionLabel"):
+            self.assertIn(
+                f"text: DeviceViewModel.connectionCard.{binding}", self.settings_qml
+            )
+        for fabricated in ("已连接", "未连接", "连接中", "重启服务", "重新连接", "启动服务"):
+            self.assertNotIn(fabricated, self.panel_qml)
+        self.assertIn("text: AppViewModel.bridgeStateLabel", self.main_qml)
 
     def test_device_status_columns_are_fixed_and_never_elided(self):
-        self.assertIn("readonly property int deviceStateColumnWidth: 96", self.device_qml)
-        self.assertIn("readonly property int deviceActionColumnWidth: tokens.buttonWidth4Chars", self.device_qml)
-        self.assertEqual(
-            self.device_qml.count(
-                "stateColumnWidth: root.deviceStateColumnWidth"
-            ),
-            3,
-        )
-        self.assertEqual(
-            self.device_qml.count(
-                "actionColumnWidth: root.deviceActionColumnWidth"
-            ),
-            4,
-        )
         self.assertIn("wrapMode: Text.NoWrap", self.inline_settings_row_qml)
         self.assertIn("elide: Text.ElideNone", self.inline_settings_row_qml)
         self.assertIn(
             "elide: root.descriptionNeverElide ? Text.ElideNone : Text.ElideRight",
             self.inline_settings_row_qml,
         )
-        self.assertEqual(
-            self.device_qml.count("descriptionNeverElide: true"),
-            1,
-        )
-        self.assertIn("descriptionNeverElide: SettingsController.isRc003Device", self.device_qml)
         self.assertIn(
             "Math.max(\n                root.stateColumnWidth",
             self.inline_settings_row_qml,
@@ -12422,8 +11928,18 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             ),
             4,
         )
+        self.assertIn("titleWidth: 150", self.settings_qml)
+        self.assertIn(
+            "property int titleColumnWidth: 160", self.diagnostic_result_row_qml
+        )
+        for pin in (
+            "Layout.preferredWidth: root.titleColumnWidth",
+            "Layout.minimumWidth: root.titleColumnWidth",
+            "Layout.maximumWidth: root.titleColumnWidth",
+        ):
+            self.assertIn(pin, self.diagnostic_result_row_qml)
         for too_long in ("版本不兼容", "等待遥控器", "系统不支持"):
-            self.assertNotIn(too_long, self.device_qml)
+            self.assertNotIn(too_long, self.view_qml)
 
     def test_settings_rows_share_the_global_row_divider(self):
         for row_qml in (
@@ -12435,28 +11951,18 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
     def test_device_page_notes_are_short_and_remove_internal_diagnostics(self):
         for expected in (
-            "登录后后台运行",
-            "自动连接遥控器",
-            "保留右下角图标；关闭此项则完全退出",
-            "未连接",
-            "让遥控器按键在电脑上生效",
-            "连接遥控器，接收按键和语音",
-            "点击“重新连接”",
-            "点击“重启服务”",
-            "点击“重新检查”",
+            "重新检查",
+            "关闭后请自行启动语音程序",
+            "以管理员身份启动语音程序",
+            "移除后，本机所有无线麦版本都不能使用自定义按键映射",
+            "逐键动作的编辑在“按键”页完成。",
         ):
-            self.assertIn(expected, self.device_qml)
+            self.assertIn(expected, self.settings_qml)
 
         for removed in (
             "需处理",
             "待实测",
             "部分可用",
-            "查看连接、按键、音频和程序日志",
-            "相当于自动点击一次",
-            "默认隐藏到通知区域；需要彻底结束时可改为完全退出",
-            "登录后自动在后台运行",
-            "打开无线麦后自动连接遥控器",
-            "设置右上角关闭按钮的行为",
             "正在检查蓝牙设备",
             "正在检查按键",
             "正在启动服务",
@@ -12471,190 +11977,127 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "服务异常",
             "权限异常",
             "语音异常",
+            "待唤醒",
         ):
-            self.assertNotIn(removed, self.device_qml)
+            self.assertNotIn(removed, self.panel_qml)
 
-        self.assertIn("SettingsController.rawInputState", self.device_qml)
-        self.assertIn("SettingsController.hidTapState", self.device_qml)
-        self.assertIn("SettingsController.voiceKeyPhysicalizerState", self.device_qml)
-        self.assertNotIn("待唤醒", self.device_qml)
-        self.assertNotIn("function bridgeDetailText()", self.device_qml)
-        self.assertNotIn("function buttonReceiverDetailText()", self.device_qml)
+        for internal in (
+            "rawInputState",
+            "hidTapState",
+            "voiceKeyPhysicalizerState",
+        ):
+            self.assertNotIn(internal, self.view_qml)
+        self.assertNotIn("function bridgeDetailText()", self.view_qml)
+        self.assertNotIn("function buttonReceiverDetailText()", self.view_qml)
 
     def test_main_window_owns_the_single_live_bridge_refresh_timer(self):
-        self.assertIn('objectName: "bridgeStatusRefreshTimer"', self.main_qml)
-        self.assertIn("? 1000 : 2000", self.main_qml)
-        self.assertIn("running: true", self.main_qml)
-        self.assertIn(
-            "onTriggered: SettingsController.refreshBridgeState()",
-            self.main_qml,
-        )
-        self.assertIn("onActiveChanged", self.main_qml)
-        self.assertIn('objectName: "bridgeLaunchPollTimer"', self.main_qml)
-        self.assertIn("interval: 150", self.main_qml)
-        self.assertIn("SettingsController.pollBridgeLaunch()", self.main_qml)
-        for page_text in (self.device_qml, self.buttons_qml, self.voice_qml):
-            self.assertNotIn("refreshBridgeState()", page_text)
+        self.assertNotIn("Timer {", self.view_qml)
+        for polling in (
+            "refreshBridgeState",
+            "pollBridgeLaunch",
+            "pollWindowRestoreRequest",
+        ):
+            self.assertNotIn(polling, self.view_qml)
+        self.assertEqual(self.view_qml.count("DeviceViewModel.refresh()"), 1)
+        self.assertIn('objectName: "settingsRefreshChecksButton"', self.settings_qml)
+        self.assertIn("onClicked: DeviceViewModel.refresh()", self.settings_qml)
 
     def test_duplicate_launch_restore_runs_through_the_qt_window(self):
-        self.assertIn(
-            "function onWindowRestoreRequested() { window.restoreWindow() }",
-            self.main_qml,
-        )
-        self.assertIn('objectName: "windowRestoreRequestTimer"', self.main_qml)
-        self.assertIn("interval: 150", self.main_qml)
-        self.assertIn(
-            "onTriggered: SettingsController.pollWindowRestoreRequest()",
-            self.main_qml,
-        )
+        restore_function = self.main_qml[
+            self.main_qml.index("function restoreWindow()"):
+            self.main_qml.index("function preferenceValue(")
+        ]
+        self.assertIn("window.showNormal()", restore_function)
+        self.assertIn("window.raise()", restore_function)
+        self.assertIn("window.requestActivate()", restore_function)
+        self.assertGreaterEqual(self.main_qml.count("window.restoreWindow()"), 2)
+        self.assertIn("reason !== Platform.SystemTrayIcon.Context", self.main_qml)
+        self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
 
     def test_navigation_switches_on_press_without_internal_check_state(self):
         self.assertIn("checkable: false", self.nav_button_qml)
         for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
             self.assertIn(f"{inset}: 0", self.nav_button_qml)
         self.assertIn('objectName: root.objectName + "_background"', self.nav_button_qml)
-        self.assertEqual(self.main_qml.count("onPressed: window.requestPage("), 3)
-        self.assertNotIn("onPressed: tabBar.currentIndex =", self.main_qml)
-        self.assertNotIn("onClicked: tabBar.currentIndex =", self.main_qml)
+        self.assertEqual(
+            self.main_qml.count("onPressed: AppViewModel.currentPage = "), 3
+        )
+        self.assertNotIn("onClicked: AppViewModel.currentPage", self.main_qml)
+        self.assertNotIn("tabBar.currentIndex =", self.main_qml)
+        self.assertNotIn("pageStack.currentIndex =", self.main_qml)
 
     def test_navigation_and_unsaved_exit_wait_for_cleanup_and_lock_during_save(self):
-        self.assertIn("function requestPage(index)", self.main_qml)
-        self.assertIn("SettingsController.stopInputCapture()", self.main_qml)
-        self.assertIn("function onInputCleanupReady()", self.main_qml)
-        self.assertIn("function onInputCleanupFailed(message)", self.main_qml)
-        self.assertIn("pendingExitPrompt", self.main_qml)
-        self.assertIn("pendingExitAutoSave", self.main_qml)
-        self.assertGreaterEqual(
-            self.main_qml.count("!SettingsController.settingsSaveBusy"),
-            4,
-        )
-        self.assertIn("Popup.NoAutoClose", self.main_qml)
-        save_function = self.main_qml[
-            self.main_qml.index("function saveAndExit()"):
-            self.main_qml.index("function discardAndExit()")
-        ]
-        self.assertNotIn("unsavedExitDialog.close()", save_function)
-        self.assertIn("onSaveSettingsAndExitFinished", self.main_qml)
-        exit_function = self.main_qml[
-            self.main_qml.index("function requestFullExit()"):
-            self.main_qml.index("function saveAndExit()")
-        ]
-        busy_index = exit_function.index("SettingsController.settingsSaveBusy")
-        dirty_index = exit_function.index("SettingsController.settingsDirty")
-        self.assertLess(busy_index, dirty_index)
-        self.assertIn(
-            "SettingsController.canAutoSaveMappingBeforeExit()",
-            exit_function,
-        )
-        self.assertIn("saveAndExit()", exit_function)
-        self.assertIn("window.beginApplicationExit()", exit_function)
-        begin_exit_function = self.main_qml[
-            self.main_qml.index("function beginApplicationExit()"):
-            self.main_qml.index("function requestFullExit()")
-        ]
-        self.assertIn("window.hide()", begin_exit_function)
-        self.assertIn(
-            "SettingsController.requestApplicationExit()", begin_exit_function
-        )
         self.assertIn("property bool applicationExitInProgress: false", self.main_qml)
-        self.assertIn(
-            "window.applicationExitInProgress = true", begin_exit_function
-        )
-        self.assertGreaterEqual(
-            self.main_qml.count("&& !window.applicationExitInProgress"),
-            2,
-        )
-        self.assertGreaterEqual(
-            self.main_qml.count("window.applicationExitInProgress = false"),
-            2,
-        )
-        self.assertIn(
-            "function onMaintenanceExitRequested() { window.requestFullExit() }",
-            self.main_qml,
-        )
-        self.assertIn(
-            "SettingsController.cancelPendingMaintenanceExit()",
-            self.main_qml,
-        )
-        self.assertGreaterEqual(
-            self.main_qml.count("SettingsController.cancelPendingMaintenanceExit()"),
-            3,
-        )
-
-    def test_first_hid_setup_waits_for_a_visible_rendered_window(self):
-        frame_handler = self.main_qml[
-            self.main_qml.index("onFrameSwapped:"):
-            self.main_qml.index("color: tokens.windowFrame")
+        exit_function = self.main_qml[
+            self.main_qml.index("function performExit()"):
+            self.main_qml.index("onClosing:")
         ]
-        self.assertIn(
-            "property bool portableHidSetupPromptAttempted: false",
-            self.main_qml,
-        )
-        self.assertIn("window.visible", frame_handler)
-        self.assertIn(
-            "SettingsController.claimPortableHidSetupPrompt()", frame_handler
-        )
-        self.assertIn("window.openHidHelperSetupPrompt()", frame_handler)
+        guard_index = exit_function.index("if (window.applicationExitInProgress)")
+        save_index = exit_function.index("MaintenanceViewModel.confirmExitSave()")
+        self.assertLess(guard_index, save_index)
+        flag_index = exit_function.index("window.applicationExitInProgress = true")
+        hide_index = exit_function.index("window.hide()")
+        quit_index = exit_function.index("Qt.quit()")
+        self.assertLess(save_index, flag_index)
+        self.assertLess(flag_index, hide_index)
+        self.assertLess(hide_index, quit_index)
+        self.assertIn("window.restoreWindow()", exit_function)
+        self.assertIn("exitFailedDialog.open()", exit_function)
+        closing_function = self.main_qml[
+            self.main_qml.index("onClosing:"):
+            self.main_qml.index("Dialog {", self.main_qml.index("onClosing:"))
+        ]
+        self.assertIn("if (window.applicationExitInProgress)", closing_function)
+        self.assertIn("close.accepted = true", closing_function)
+        self.assertIn("close.accepted = false", closing_function)
+        self.assertIn('preferenceValue("hide_to_tray_on_close", true)', closing_function)
+        self.assertIn('objectName: "exitFailedDialog"', self.main_qml)
 
     def test_device_page_owns_the_three_desktop_behavior_options(self):
-        self.assertIn('objectName: "desktopBehaviorSection"', self.device_qml)
-        self.assertIn(
-            'objectName: "desktopBehaviorSectionTitle"', self.device_qml
-        )
-        self.assertIn('text: qsTr("通用设置")', self.device_qml)
-        self.assertIn('objectName: "launchAtLoginSwitch"', self.device_qml)
-        self.assertIn('objectName: "launchBridgeOnAppStartSwitch"', self.device_qml)
-        self.assertIn('objectName: "diagnosticTraceSwitch"', self.device_qml)
-        self.assertIn('objectName: "closeBehaviorSwitch"', self.device_qml)
-        self.assertIn("SettingsController.setLaunchAtLogin", self.device_qml)
-        self.assertIn("SettingsController.setLaunchBridgeOnAppStart", self.device_qml)
-        self.assertIn("SettingsController.setDiagnosticTraceEnabled", self.device_qml)
-        self.assertIn("SettingsController.setCloseBehaviorIndex", self.device_qml)
-        self.assertIn('titleText: qsTr("启动程序时自动运行服务")', self.device_qml)
-        self.assertIn("自动连接遥控器", self.device_qml)
-        self.assertNotIn("与随 Windows 启动互不绑定", self.device_qml)
+        self.assertEqual(self.settings_qml.count("MaintenanceViewModel.preferences"), 1)
+        self.assertEqual(self.view_qml.count("MaintenanceViewModel.setPreference("), 1)
+        self.assertIn("MaintenanceViewModel.setPreference(", self.settings_qml)
+        for backend_setter in (
+            "setLaunchAtLogin",
+            "setLaunchBridgeOnAppStart",
+            "setDiagnosticTraceEnabled",
+            "setCloseBehaviorIndex",
+        ):
+            self.assertNotIn(backend_setter, self.view_qml)
+        self.assertIn('text: qsTr("通用设置")', self.settings_qml)
         self.assertNotIn("GeneralPage", self.main_qml)
         self.assertNotIn('objectName: "generalTabButton"', self.main_qml)
         self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
         self.assertIn("window.showNormal()", self.main_qml)
-        self.assertIn(
-            "reason !== Platform.SystemTrayIcon.Context",
-            self.main_qml,
-        )
-        self.assertIn("SettingsController.requestApplicationExit()", self.main_qml)
-        self.assertIn("SettingsController.applicationExitConfirmed", self.main_qml)
-
-        runtime_log_index = self.device_qml.index(
-            'objectName: "runtimeLogRow"'
-        )
-        general_title_index = self.device_qml.index(
-            'objectName: "desktopBehaviorSectionTitle"'
-        )
-        first_option_index = self.device_qml.index(
-            'objectName: "launchAtLoginRow"'
-        )
-        self.assertLess(runtime_log_index, general_title_index)
-        self.assertLess(general_title_index, first_option_index)
-        self.assertNotIn("iconGlyph:", self.device_qml)
+        self.assertIn("reason !== Platform.SystemTrayIcon.Context", self.main_qml)
+        self.assertIn("window.performExit()", self.main_qml)
+        self.assertIn("MaintenanceViewModel.confirmExitSave()", self.main_qml)
+        self.assertNotIn("iconGlyph:", self.settings_qml)
         self.assertNotIn("property string iconGlyph", self.settings_list_row_qml)
         self.assertNotIn("IconGlyph {", self.settings_list_row_qml)
 
     def test_update_entry_keeps_manual_download_and_existing_dialog_style(self):
+        self.assertEqual(self.view_qml.count('objectName: "settingsUpdateActionButton"'), 1)
+        self.assertEqual(self.view_qml.count('MaintenanceViewModel.run("update")'), 1)
         self.assertIn(
-            'objectName: "checkApplicationUpdateButton"', self.device_qml
+            "text: MaintenanceViewModel.updateStatus.actionLabel", self.settings_qml
         )
-        self.assertIn('qsTr("检查更新")', self.device_qml)
-        self.assertIn(
-            "SettingsController.checkForApplicationUpdate()", self.device_qml
+        self.assertEqual(
+            self.view_qml.count("MaintenanceViewModel.cancelUpdateDownload()"), 1
         )
-        self.assertIn('objectName: "applicationUpdateDialog"', self.main_qml)
-        self.assertIn("textFormat: TextEdit.PlainText", self.main_qml)
-        self.assertIn('qsTr("下载更新")', self.main_qml)
-        self.assertIn('qsTr("打开桌面")', self.main_qml)
-        self.assertIn(
-            "SettingsController.cancelApplicationUpdateDownload()", self.main_qml
+        self.assertEqual(
+            self.view_qml.count("MaintenanceViewModel.openUpdateRelease()"), 1
         )
-        self.assertNotIn("launchDownloadedApplicationUpdate", self.main_qml)
+        self.assertIn('objectName: "settingsCancelUpdateDownloadButton"', self.settings_qml)
+        self.assertIn('objectName: "settingsOpenUpdateReleaseButton"', self.settings_qml)
+        for auto_flow in (
+            "applicationUpdateDialog",
+            "checkForApplicationUpdate",
+            "downloadApplicationUpdate",
+            "openDownloadedApplicationUpdate",
+            "launchDownloadedApplicationUpdate",
+        ):
+            self.assertNotIn(auto_flow, self.view_qml)
 
     def test_windows_prefers_the_system_chinese_ui_font(self):
         self.assertIn(
@@ -12669,8 +12112,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn('Accessible.name: qsTr("关闭")', self.dialog_close_button_qml)
         self.assertNotIn("ToolTip", self.dialog_close_button_qml)
         self.assertIn("renderType: Text.QtRendering", self.icon_glyph_qml)
-        self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
-        self.assertEqual(self.voice_qml.count("SettingsDialog {"), 2)
+        self.assertEqual(self.settings_dialog_qml.count("DialogCloseButton {"), 1)
+        self.assertEqual(self.keys_qml.count("SettingsDialog {"), 2)
+        self.assertEqual(self.settings_qml.count("SettingsDialog {"), 3)
+        for panel_text in (self.main_qml, self.home_qml, self.keys_qml, self.settings_qml):
+            self.assertNotIn("DialogCloseButton {", panel_text)
 
     def test_tooltips_are_compact_and_follow_each_truncated_text(self):
         self.assertIn("ToolTip {", self.compact_tooltip_qml)
@@ -12684,24 +12130,6 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
             self.assertIn(f"{inset}: 0", self.compact_tooltip_qml)
         self.assertIn("maximumTextWidth: 260", self.compact_tooltip_qml)
-        self.assertEqual(self.buttons_qml.count("CompactToolTip {"), 3)
-        for title_id in (
-            "primaryGestureTitle",
-            "doubleGestureTitle",
-            "longGestureTitle",
-        ):
-            self.assertIn(f"id: {title_id}", self.buttons_qml)
-        for title_id in (
-            "primaryGestureTitle",
-            "doubleGestureTitle",
-            "longGestureTitle",
-        ):
-            title_start = self.buttons_qml.index(f"id: {title_id}")
-            tooltip_start = self.buttons_qml.index("CompactToolTip {", title_start)
-            title_source = self.buttons_qml[title_start:tooltip_start]
-            self.assertIn("Layout.fillHeight: true", title_source)
-            self.assertIn("verticalAlignment: Text.AlignVCenter", title_source)
-        self.assertNotIn("ToolTip.visible", self.buttons_qml)
         self.assertIn("gestureHover.hovered && !cell.empty", self.mapping_card_qml)
         self.assertIn("cell.usingNote || valueLabel.truncated", self.mapping_card_qml)
         self.assertNotIn("actionHover", self.mapping_card_qml)
@@ -12717,8 +12145,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("descriptionHover.hovered && descriptionLabel.truncated", self.inline_settings_row_qml)
         self.assertIn("descriptionHover.hovered && descriptionLabel.truncated", self.settings_list_row_qml)
         self.assertIn("detailHover.hovered && detailLabel.truncated", self.diagnostic_result_row_qml)
-        self.assertIn("globalStatusHover.hovered", self.main_qml)
-        self.assertIn("globalStatusText.truncated", self.main_qml)
+        self.assertIn("noteHover.hovered && noteText.length > 0", self.home_qml)
 
     def test_icon_glyph_has_windows_10_font_fallback(self):
         self.assertIn('Qt.fontFamilies().indexOf("Segoe Fluent Icons")', self.icon_glyph_qml)
@@ -12726,113 +12153,98 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("font.family: iconFontFamily", self.icon_glyph_qml)
 
     def test_device_page_shows_real_service_state_and_start_progress(self):
-        self.assertIn("SettingsController.bridgeLaunchBusy", self.device_qml)
-        self.assertIn("SettingsController.bridgeConnected", self.device_qml)
-        self.assertIn("SettingsController.bridgeRunning", self.device_qml)
-        self.assertIn("SettingsController.bridgeLaunchPhase", self.device_qml)
-        self.assertIn('qsTr("启动中…")', self.device_qml)
-        self.assertIn("enabled: !SettingsController.bridgeLaunchBusy", self.device_qml)
+        for binding in ("title", "subtitle", "detail", "actionLabel"):
+            self.assertIn(
+                f"text: DeviceViewModel.connectionCard.{binding}", self.settings_qml
+            )
+        self.assertIn(
+            "color: root.toneColor(DeviceViewModel.connectionCard.tone)",
+            self.settings_qml,
+        )
+        self.assertIn(
+            "onClicked: root.showFeedback(DeviceViewModel.bridgeAction())",
+            self.settings_qml,
+        )
+        for fake_state in ("已连接", "未连接", "启动中", "连接中"):
+            self.assertNotIn(fake_state, self.panel_qml)
 
     def test_voice_page_states_real_windows_boundaries_without_fake_grants(self):
-        for object_name in (
-            "openMicrophonePrivacyButton",
-            "openVoiceProgramSettingsButton",
-        ):
-            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
-        self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
-        self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
-        self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
+        self.assertIn('objectName: "settingsMicrophonePrivacyLink"', self.settings_qml)
         self.assertIn(
-            'qsTr("请录入按住型快捷键")',
-            self.voice_qml,
+            "MaintenanceViewModel.openMicrophonePrivacySettings()", self.settings_qml
         )
-        self.assertIn(
-            'qsTr("刷新时会打开微信设置")',
-            self.voice_qml,
-        )
-        self.assertIn(
-            'qsTr("自动读取按住型快捷键")',
-            self.voice_qml,
-        )
-        self.assertIn(
-            'qsTr("自动读取开关型快捷键")',
-            self.voice_qml,
-        )
-        self.assertNotIn('? qsTr("无需设置")', self.voice_qml)
-        self.assertIn("SettingsController.hotkeyCaptureReady", self.voice_qml)
-        self.assertIn('qsTr("准备中")', self.voice_qml)
-        self.assertIn('qsTr("正在准备…")', self.voice_qml)
-        self.assertIn('? qsTr("录入中")', self.voice_qml)
-        self.assertIn(
-            'SettingsController.voiceHotkeySaveState === "retry"',
-            self.voice_qml,
-        )
-        self.assertIn('qsTr("点击“安装音频”")', self.voice_qml)
-        self.assertIn('qsTr("请重新选择端点")', self.voice_qml)
-        self.assertIn('qsTr("点击“重新检查”")', self.voice_qml)
-        self.assertIn('qsTr("请手动验证")', self.voice_qml)
-        self.assertNotIn('text: qsTr("语音试说")', self.voice_qml)
-        self.assertIn('qsTr("退出后点“重新检测”")', self.voice_qml)
-        self.assertNotIn('qsTr("需处理")', self.voice_qml)
-        self.assertNotIn('qsTr("待完成")', self.voice_qml)
+        self.assertIn('objectName: "settingsOpenVoiceProgramSettingsButton"', self.settings_qml)
+        self.assertIn("VoiceViewModel.openVoiceProgramSettings()", self.settings_qml)
         for misleading_claim in (
             "已授权",
             "无线麦需要管理员权限",
             "VB-CABLE 安装成功",
+            "待确认",
+            "无需设置",
         ):
-            self.assertNotIn(misleading_claim, self.voice_qml)
-        self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
-        self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
-        self.assertNotIn('objectName: "speakTestDialog"', self.voice_qml)
+            self.assertNotIn(misleading_claim, self.panel_qml)
+        self.assertIn('qsTr("尚未录入")', self.settings_qml)
+        self.assertIn("VoiceViewModel.hotkeyLabel", self.settings_qml)
+        self.assertIn("VoiceViewModel.startHotkeyCapture()", self.settings_qml)
+        self.assertIn('objectName: "dictationHonestyNote"', self.home_qml)
+        self.assertIn("无法区分手工输入、粘贴与真实口述", self.home_qml)
 
     def test_voice_program_state_does_not_treat_an_idle_window_as_failure(self):
-        self.assertNotIn("running_not_ready", self.voice_qml)
+        for code_branch in (
+            "running_not_ready",
+            "voiceProgramStatusCode",
+            "checkState(",
+        ):
+            self.assertNotIn(code_branch, self.view_qml)
+        self.assertIn("valueText: VoiceViewModel.voiceCard.title", self.home_qml)
+        self.assertIn("noteText: VoiceViewModel.voiceCard.subtitle", self.home_qml)
         self.assertIn(
-            'SettingsController.voiceProgramStatusCode === "running"',
-            self.voice_qml,
+            "dotColor: root.toneColor(VoiceViewModel.voiceCard.tone)", self.home_qml
         )
-        self.assertIn("tokens.successColor", self.voice_qml)
+        ok_index = self.home_qml.index('if (tone === "ok")')
+        success_index = self.home_qml.index("return tokens.successColor")
+        self.assertLess(ok_index, success_index)
+        self.assertIn("tokens.successColor", self.home_qml)
 
     def test_device_and_voice_guidance_use_the_shared_page_navigation(self):
-        self.assertIn("signal openButtonsRequested()", self.device_qml)
-        self.assertIn("onOpenButtonsRequested: window.requestPage(1)", self.main_qml)
-        self.assertIn("signal openDeviceRequested()", self.voice_qml)
-        self.assertIn("signal openButtonsRequested()", self.voice_qml)
-        self.assertIn("onOpenDeviceRequested: window.requestPage(0)", self.main_qml)
-        self.assertGreaterEqual(
-            self.main_qml.count("onOpenButtonsRequested: window.requestPage(1)"),
-            2,
+        self.assertEqual(
+            self.main_qml.count("onPressed: AppViewModel.currentPage = "), 3
         )
+        for panel_text in (self.home_qml, self.keys_qml, self.settings_qml):
+            self.assertNotIn("AppViewModel.currentPage =", panel_text)
+            self.assertNotIn("requestPage(", panel_text)
+        self.assertIn("逐键动作的编辑在“按键”页完成。", self.settings_qml)
 
     def test_buttons_page_keeps_the_mapping_cards_and_photo_sidebar(self):
         for object_name in ("photoSidebar", "photoFrame", "photoImage"):
-            self.assertIn(f'objectName: "{object_name}"', self.buttons_qml)
-        self.assertIn("SettingsController.photoSource", self.buttons_qml)
-        self.assertIn("SettingsController.photoAvailable", self.buttons_qml)
-        self.assertIn('objectName: "photoHotspot_" + buttonId', self.buttons_qml)
+            self.assertIn(f'objectName: "{object_name}"', self.keys_qml)
+        self.assertIn("readonly property bool photoAvailable", self.keys_qml)
+        self.assertIn("source: root.photoSourceUrl", self.keys_qml)
+        self.assertIn("photoProbeCanvas.loadImage(", self.keys_qml)
+        self.assertIn("photoProbeCanvas.isImageLoaded(", self.keys_qml)
         self.assertIn(
-            'objectName: "photoHotspotMarker_" + photoHotspot.buttonId',
-            self.buttons_qml,
+            'objectName: "photoHotspotMarker_" + photoHotspot.buttonId', self.keys_qml
         )
-        self.assertIn('objectName: "mappingLines"', self.buttons_qml)
-        self.assertIn('objectName: "activeMappingLine"', self.buttons_qml)
-        self.assertIn("function connectorControlRadius(startX, endX)", self.buttons_qml)
-        self.assertIn("function connectorRoute(card, hotspot, coordinateItem)", self.buttons_qml)
-        self.assertEqual(self.buttons_qml.count("ctx.bezierCurveTo("), 1)
-        self.assertNotIn("ctx.quadraticCurveTo(", self.buttons_qml)
-        self.assertNotIn("ctx.lineTo(endX", self.buttons_qml)
-        self.assertIn('ctx.lineCap = "round"', self.buttons_qml)
-        self.assertIn("active ? 2.2 : 1.25", self.buttons_qml)
-        self.assertIn("hotspotX * photoImage.paintedWidth", self.buttons_qml)
-        self.assertIn("hotspotY * photoImage.paintedHeight", self.buttons_qml)
-        self.assertIn("visible: photoHotspot.isSelected", self.buttons_qml)
-        self.assertIn('objectName: "leftMappingCards"', self.buttons_qml)
-        self.assertIn('objectName: "rightMappingCards"', self.buttons_qml)
-        self.assertIn("MappingCard {", self.buttons_qml)
-        self.assertIn("leftCardRepeater.itemAt(i)", self.buttons_qml)
-        self.assertIn("rightCardRepeater.itemAt(i)", self.buttons_qml)
-        self.assertIn("photoHotspotRepeater.itemAt(i)", self.buttons_qml)
-        self.assertNotIn("function targetY(buttonId)", self.buttons_qml)
+        self.assertIn('objectName: "mappingLines"', self.keys_qml)
+        self.assertIn('objectName: "activeMappingLine"', self.keys_qml)
+        self.assertIn("function connectorControlRadius(startX, endX)", self.keys_qml)
+        self.assertIn("function connectorRoute(card, hotspot, coordinateItem)", self.keys_qml)
+        self.assertEqual(self.keys_qml.count("ctx.bezierCurveTo("), 1)
+        self.assertNotIn("ctx.quadraticCurveTo(", self.keys_qml)
+        self.assertNotIn("ctx.lineTo(endX", self.keys_qml)
+        self.assertIn('ctx.lineCap = "round"', self.keys_qml)
+        self.assertIn("active ? 2.2 : 1.25", self.keys_qml)
+        self.assertIn("hotspot[0] * photoImage.paintedWidth", self.keys_qml)
+        self.assertIn("hotspot[1] * photoImage.paintedHeight", self.keys_qml)
+        self.assertIn("visible: photoHotspot.isSelected", self.keys_qml)
+        self.assertIn('objectName: "leftMappingCards"', self.keys_qml)
+        self.assertIn('objectName: "rightMappingCards"', self.keys_qml)
+        self.assertEqual(self.keys_qml.count("MappingCard {"), 2)
+        self.assertEqual(self.keys_qml.count("model: MappingViewModel.buttons"), 3)
+        self.assertIn("leftCardRepeater.itemAt(i)", self.keys_qml)
+        self.assertIn("rightCardRepeater.itemAt(i)", self.keys_qml)
+        self.assertIn("photoHotspotRepeater.itemAt(i)", self.keys_qml)
+        self.assertNotIn("function targetY(buttonId)", self.keys_qml)
         self.assertIn("root.selected ? root.tokens.accentSoft", self.mapping_card_qml)
         self.assertIn("border.width: root.tokens.hairlineWidth", self.mapping_card_qml)
         self.assertIn("root.tokens.cardBorder", self.mapping_card_qml)
@@ -12851,186 +12263,153 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.assertIn(f'qsTr("{column_name}")', self.mapping_card_qml)
         self.assertIn('objectName: exposeObjectNames ? "editMapping_" + cardId', self.mapping_card_qml)
 
-    def test_action_combo_group_headers_do_not_add_model_rows(self):
-        self.assertIn(
-            "SettingsController.actionOptionGroupTitle(String(modelData))",
-            self.buttons_qml,
-        )
-        self.assertIn("title !== SettingsController.actionOptionGroupTitle(", self.buttons_qml)
-        self.assertIn("groupHeaderHeight: editorCombo.groupHeaderHeightAt(index)", self.buttons_qml)
-        self.assertIn("value: editorCombo.optionsHeight", self.buttons_qml)
-        self.assertIn("Math.ceil(tokens.fontSizeTiny) + tokens.spacingMedium", self.buttons_qml)
-        self.assertIn("topPadding: groupHeaderHeight", self.buttons_qml)
-        self.assertIn("bottomPadding: 0", self.buttons_qml)
-        self.assertIn("color: tokens.textSecondary", self.buttons_qml)
-        self.assertIn("color: tokens.border", self.buttons_qml)
-        self.assertIn("height: optionDelegate.groupHeaderHeight", self.buttons_qml)
-        self.assertNotIn('ListElement { text: "按键操作"', self.buttons_qml)
-
     def test_visible_mapping_inputs_share_the_grouped_action_sources(self):
-        self.assertIn("model: SettingsController.primaryActionOptionsFor(", self.buttons_qml)
-        self.assertIn("actionEditor.buttonId", self.buttons_qml)
+        self.assertEqual(self.view_qml.count('objectName: "actionEditorDialog"'), 1)
+        self.assertEqual(self.keys_qml.count("SettingsDialog {"), 2)
+        self.assertEqual(self.keys_qml.count("MappingViewModel.setAction("), 2)
+        self.assertEqual(self.keys_qml.count("MappingViewModel.setNote("), 1)
+        self.assertEqual(self.keys_qml.count("MappingViewModel.pickProgramPath("), 2)
+        self.assertEqual(self.keys_qml.count("MappingViewModel.setTextContent("), 1)
+        self.assertEqual(self.keys_qml.count("if (result && !result.ok)"), 5)
+        self.assertIn("if (result.ok)", self.keys_qml)
+        self.assertNotIn("ListView {", self.keys_qml)
+        self.assertNotIn('objectName: "saveMappingButton"', self.view_qml)
+        self.assertNotIn('text: qsTr("保存映射")', self.view_qml)
+        self.assertNotIn("isRc003Device", self.view_qml)
         self.assertEqual(
-            self.buttons_qml.count("model: SettingsController.secondaryActionOptionsFor(actionEditor.buttonId)"),
-            1,
+            self.view_qml.count('objectName: "retryMappingAutoSaveButton"'), 1
         )
-        self.assertEqual(
-            self.buttons_qml.count("model: SettingsController.longPressActionOptionsFor(actionEditor.buttonId)"),
-            1,
+        self.assertIn(
+            "visible: MappingViewModel.mappingAutoSaveRetryAvailable", self.keys_qml
         )
-        self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
-        self.assertIn('objectName: "actionEditorDialog"', self.buttons_qml)
-        self.assertIn('readonly property string headerText: buttonName.length > 0', self.buttons_qml)
-        self.assertIn('text: actionEditor.headerText', self.buttons_qml)
-        self.assertIn('text: shortcutRecorder.headerText', self.buttons_qml)
-        self.assertNotIn('text: actionEditor.title', self.buttons_qml)
-        self.assertNotIn('text: shortcutRecorder.title', self.buttons_qml)
-        self.assertNotIn('text: "×"', self.buttons_qml)
-        self.assertNotIn('text: "X"', self.buttons_qml)
-        self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
-        self.assertIn("optionDelegate.highlighted", self.buttons_qml)
-        self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
-        self.assertIn("property int count: SettingsController.isRc003Device ? 13 : 15", self.buttons_qml)
-        self.assertNotIn("ListView {", self.buttons_qml)
-        self.assertNotIn('objectName: "voiceSettingsPanel"', self.buttons_qml)
-        self.assertNotIn('objectName: "voiceProgramDialog"', self.buttons_qml)
-        self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
-        self.assertIn('objectName: "holdVoiceHotkeyField"', self.voice_qml)
-        self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
-        self.assertIn('qsTr("检测真实按键")', self.buttons_qml)
-        self.assertNotIn('objectName: "saveMappingButton"', self.buttons_qml)
-        self.assertNotIn('text: qsTr("保存映射")', self.buttons_qml)
-        self.assertIn('objectName: "retryMappingAutoSaveButton"', self.main_qml)
-        self.assertIn("SettingsController.retryMappingAutoSave()", self.main_qml)
-
-    def test_buttons_page_device_track_precedes_single_mapping_and_actions(self):
-        switch_index = self.buttons_qml.index('objectName: "mappingViewSwitcher"')
-        single_index = self.buttons_qml.index('objectName: "mappingList"')
-        actions_index = self.buttons_qml.index('objectName: "mappingActionsPanel"')
-        switcher_source = self.buttons_qml[switch_index:single_index]
-
-        self.assertLess(switch_index, single_index)
-        self.assertLess(single_index, actions_index)
-        self.assertEqual(switcher_source.count("Layout.preferredWidth: 1"), 2)
-        self.assertIn("text: SettingsController.deviceOptions[0]", switcher_source)
-        self.assertIn("text: SettingsController.deviceOptions[1]", switcher_source)
-        self.assertIn("highlighted: SettingsController.isRc003Device", switcher_source)
-        self.assertIn("highlighted: !SettingsController.isRc003Device", switcher_source)
-        self.assertNotIn('objectName: "comboMappingList"', self.buttons_qml)
-        self.assertNotIn("model: SettingsController.comboRows", self.buttons_qml)
-        self.assertNotIn('objectName: "comboActionEditor_" + buttonId', self.buttons_qml)
+        self.assertIn(
+            "onClicked: MappingViewModel.retryMappingAutoSave()", self.keys_qml
+        )
+        self.assertIn("MappingViewModel.restoreDefaults()", self.settings_qml)
+        self.assertIn('qsTr("检测真实按键")', self.keys_qml)
+        self.assertIn("MappingViewModel.startKeyDetection()", self.keys_qml)
+        self.assertIn("MappingViewModel.stopKeyDetection()", self.keys_qml)
 
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
-        self.assertIn('placeholderText: qsTr("尚未录入")', self.voice_qml)
-        self.assertIn(
-            'qsTr("请录入按住型快捷键")',
-            self.voice_qml,
+        self.assertEqual(
+            self.view_qml.count('objectName: "settingsStartHotkeyCaptureButton"'), 1
         )
-        self.assertIn(
-            'qsTr("语音按键，录入%1快捷键").arg(root.voiceHotkeyModeLabel)',
-            self.voice_qml,
+        self.assertEqual(
+            self.view_qml.count('objectName: "settingsStopHotkeyCaptureButton"'), 1
         )
-        self.assertNotIn('qsTr("微信语音无需设置快捷键")', self.voice_qml)
-        self.assertIn('objectName: "recordVoiceHotkeyButton"', self.voice_qml)
-        self.assertNotIn("windowsDictationSelected", self.voice_qml)
-        self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
-        self.assertIn(
-            "if (!SettingsController.startHotkeyCapture())",
-            self.voice_qml,
-        )
-        self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
+        self.assertEqual(self.view_qml.count("VoiceViewModel.startHotkeyCapture()"), 1)
+        self.assertEqual(self.view_qml.count("VoiceViewModel.stopHotkeyCapture()"), 1)
+        self.assertIn("VoiceViewModel.hotkeyLabel", self.settings_qml)
+        self.assertNotIn("hotkeyLabel", self.keys_qml)
+        self.assertNotIn("HotkeyCapture", self.keys_qml)
+        self.assertNotIn("startHotkeyCapture", self.home_qml)
+        self.assertIn('qsTr("尚未录入")', self.settings_qml)
+        self.assertIn('objectName: "settingsOpenVoiceProgramSettingsButton"', self.settings_qml)
+        for retired in (
+            "windowsDictationSelected",
+            'objectName: "holdVoiceHotkeyField"',
+            'objectName: "recordVoiceHotkeyButton"',
+        ):
+            self.assertNotIn(retired, self.view_qml)
 
     def test_voice_program_section_has_no_redundant_note_only_row(self):
-        self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
-        self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
-        self.assertNotIn("voiceProgramLaunchDescription", self.voice_qml)
-        voice_hotkey_block = self.voice_qml.split(
-            'objectName: "voiceHotkeyRow"', 1
-        )[1].split('objectName: "voiceTestSection"', 1)[0]
-        self.assertIn("showDivider: false", voice_hotkey_block)
+        import re
+
+        self.assertEqual(self.home_qml.count("VoiceViewModel.voiceCard"), 3)
+        self.assertEqual(self.settings_qml.count("VoiceViewModel.voiceCard"), 0)
+        self.assertEqual(self.keys_qml.count("VoiceViewModel.voiceCard"), 0)
+        for retired in (
+            'objectName: "voiceProgramSpecificRow"',
+            'objectName: "voiceProgramLaunchText"',
+            "voiceProgramLaunchDescription",
+        ):
+            self.assertNotIn(retired, self.view_qml)
+        row_starts = [
+            match.start()
+            for match in re.finditer(r"SettingsListRow \{", self.settings_qml)
+        ]
+        self.assertEqual(len(row_starts), 3)
+        dialogs_start = self.settings_qml.index("\n    SettingsDialog {")
+        for position, start in enumerate(row_starts):
+            end = (
+                row_starts[position + 1]
+                if position + 1 < len(row_starts)
+                else dialogs_start
+            )
+            block = self.settings_qml[start:end]
+            self.assertTrue(
+                "CompactSwitch {" in block or "CompactButton {" in block,
+                f"SettingsListRow at offset {start} renders no control",
+            )
 
     def test_voice_rows_use_the_shared_fixed_action_column(self):
-        self.assertIn(
-            "settingsActionColumnWidth: tokens.buttonWidth6Chars",
-            self.voice_qml,
+        self.assertIn("property int buttonWidth2Chars: 48", self.tokens_qml)
+        self.assertIn("property int buttonWidth4Chars: 72", self.tokens_qml)
+        self.assertIn("property int buttonWidth6Chars: 92", self.tokens_qml)
+        self.assertIn("property int buttonWidth9Chars: 120", self.tokens_qml)
+        self.assertEqual(
+            self.settings_qml.count("CompactButton {"),
+            self.settings_qml.count("compactMinimumWidth: root.tokens.buttonWidth"),
         )
-        self.assertRegex(
-            self.voice_qml,
-            r'(?s)objectName: "testVbCableChannelButton".*?'
-            r"Layout\.fillWidth: true",
+        self.assertGreaterEqual(
+            self.settings_qml.count(
+                "compactMinimumWidth: root.tokens.buttonWidth6Chars"
+            ),
+            1,
         )
+        self.assertIn("property int actionColumnWidth: 0", self.inline_settings_row_qml)
 
     def test_conflicting_audio_work_locks_direct_writes_but_mapping_page_has_no_save_control(self):
+        for backend in ("SettingsController", "DiagnosticsController"):
+            self.assertNotIn(backend, self.view_qml)
+        self.assertEqual(self.keys_qml.count("if (result && !result.ok)"), 5)
+        self.assertIn("if (result.ok)", self.keys_qml)
+        self.assertNotIn('objectName: "saveMappingButton"', self.view_qml)
+        self.assertNotIn('text: qsTr("保存映射")', self.view_qml)
+        self.assertNotIn("saveMapping", self.keys_qml)
+        self.assertIn('objectName: "retryMappingAutoSaveButton"', self.keys_qml)
         self.assertIn(
-            "readonly property bool endpointPreflightBusy:",
-            self.voice_qml,
+            "visible: MappingViewModel.mappingAutoSaveRetryAvailable", self.keys_qml
         )
-        self.assertIn("readonly property bool configurationWriteBusy:", self.voice_qml)
-        for busy_source in (
-            "DiagnosticsController.driverActionRunning",
-            "DiagnosticsController.vbCableTestRunning",
-            "SettingsController.bridgeLaunchBusy",
-            "root.endpointPreflightBusy",
-        ):
-            self.assertIn(busy_source, self.voice_qml)
-        self.assertGreaterEqual(
-            self.voice_qml.count("!root.configurationWriteBusy"),
-            9,
-        )
-        self.assertIn(
-            "&& !SettingsController.settingsSaveBusy",
-            self.voice_qml,
-        )
-        self.assertIn(
-            "&& !SettingsController.endpointPreflightBusy",
-            self.device_qml,
-        )
-        self.assertIn(
-            "&& !DiagnosticsController.driverActionRunning",
-            self.device_qml,
-        )
-        self.assertNotIn('objectName: "saveMappingButton"', self.buttons_qml)
-        self.assertNotIn("configurationWriteBusy", self.buttons_qml)
+
 
 
 class ThreePageSettingsSourceContractTests(unittest.TestCase):
     def setUp(self):
         qml_dir = Path(qt_settings_app.__file__).resolve().parent / "qml"
-        self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
-        self.tokens_qml = (qml_dir / "Tokens.qml").read_text(encoding="utf-8")
-        self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
-        self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
-        self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(encoding="utf-8")
-        self.inline_row_qml = (qml_dir / "InlineSettingsRow.qml").read_text(
-            encoding="utf-8"
+        self.qml_dir = qml_dir
+
+        def load(name):
+            return (qml_dir / name).read_text(encoding="utf-8")
+
+        self.main_qml = load("main.qml")
+        self.tokens_qml = load("Tokens.qml")
+        self.home_qml = load("HomePanel.qml")
+        self.keys_qml = load("KeysPanel.qml")
+        self.settings_qml = load("SettingsPanel.qml")
+        self.inline_row_qml = load("InlineSettingsRow.qml")
+        self.mapping_card_qml = load("MappingCard.qml")
+        self.compact_button_qml = load("CompactButton.qml")
+        self.compact_text_field_qml = load("CompactTextField.qml")
+        self.compact_switch_qml = load("CompactSwitch.qml")
+        self.selection_combo_qml = load("SelectionComboBox.qml")
+        self.section_frame_qml = load("SectionFrame.qml")
+        self.view_qml = "\n".join(
+            load(name) for name in sorted(p.name for p in qml_dir.glob("*.qml"))
         )
-        self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
-            encoding="utf-8"
-        )
-        self.compact_button_qml = (qml_dir / "CompactButton.qml").read_text(
-            encoding="utf-8"
-        )
-        self.compact_text_field_qml = (qml_dir / "CompactTextField.qml").read_text(
-            encoding="utf-8"
-        )
-        self.compact_switch_qml = (qml_dir / "CompactSwitch.qml").read_text(
-            encoding="utf-8"
-        )
-        self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
-            encoding="utf-8"
-        )
-        self.section_frame_qml = (qml_dir / "SectionFrame.qml").read_text(
-            encoding="utf-8"
+        self.panel_qml = "\n".join(
+            (self.main_qml, self.home_qml, self.keys_qml, self.settings_qml)
         )
 
     def test_navigation_has_only_device_buttons_and_voice(self):
         for object_name, label in (
-            ("deviceTabButton", "设备"),
+            ("homeTabButton", "首页"),
             ("mappingTabButton", "按键"),
-            ("voiceTabButton", "语音"),
+            ("settingsTabButton", "设置"),
         ):
             self.assertIn(f'objectName: "{object_name}"', self.main_qml)
             self.assertIn(f'text: qsTr("{label}")', self.main_qml)
+        self.assertEqual(self.main_qml.count("NavButton {"), 3)
         for retired in (
             "connectionTabButton",
             "permissionsTabButton",
@@ -13039,11 +12418,15 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             "PermissionsPage",
             "DiagnosticsPage",
             "GeneralPage",
+            "DevicePage",
+            "ButtonsPage",
+            "VoicePage",
         ):
             self.assertNotIn(retired, self.main_qml)
-        self.assertIn("DevicePage {", self.main_qml)
-        self.assertIn("ButtonsPage {", self.main_qml)
-        self.assertIn("VoicePage {", self.main_qml)
+        self.assertIn("HomePanel {", self.main_qml)
+        self.assertIn("KeysPanel {", self.main_qml)
+        self.assertIn("SettingsPanel {", self.main_qml)
+        self.assertIn("currentIndex: AppViewModel.currentPage", self.main_qml)
 
     def test_window_uses_the_inset_rounded_client_shell(self):
         for token_name in (
@@ -13089,8 +12472,8 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
 
     def test_global_status_bar_uses_background_without_a_top_rule(self):
         status_bar_source = self.main_qml[
-            self.main_qml.index('id: globalStatusBar'):
-            self.main_qml.index('id: globalStatusText')
+            self.main_qml.index("id: globalStatusBar"):
+            self.main_qml.index('objectName: "versionLabel"')
         ]
         self.assertIn("tokens.background", status_bar_source)
         self.assertNotIn("tokens.statusBackground", status_bar_source)
@@ -13099,7 +12482,7 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
     def test_regular_frames_share_one_hairline_width(self):
         for source in (
             self.main_qml,
-            self.buttons_qml,
+            self.keys_qml,
             self.mapping_card_qml,
             self.compact_button_qml,
             self.compact_text_field_qml,
@@ -13111,36 +12494,38 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertNotIn("border.width: 0.75", self.mapping_card_qml)
 
     def test_device_page_contains_device_and_desktop_behavior_rows(self):
-        for object_name in (
-            "currentDeviceRow",
-            "buttonReceiverRow",
-            "remoteServiceRow",
-            "runtimeLogRow",
-            "launchAtLoginRow",
-            "launchBridgeOnAppStartRow",
-            "diagnosticTraceRow",
-            "closeBehaviorRow",
-        ):
-            self.assertIn(f'objectName: "{object_name}"', self.device_qml)
+        import re
+
+        self.assertIn('objectName: "settingsDeviceSection"', self.settings_qml)
+        self.assertIn("model: DeviceViewModel.remoteChoices", self.settings_qml)
+        self.assertIn("model: DeviceViewModel.checks", self.settings_qml)
         for button_name in (
-            "refreshDeviceChecksButton",
-            "openBluetoothSettingsButton",
-            "openButtonSettingsButton",
-            "bridgeActionButton",
-            "checkApplicationUpdateButton",
-            "deviceOpenLogButton",
+            "settingsBridgeActionButton",
+            "settingsRefreshChecksButton",
+            "settingsUpdateActionButton",
+            "settingsRemoveHelperButton",
         ):
-            self.assertIn(f'objectName: "{button_name}"', self.device_qml)
-        self.assertIn("SettingsController.startBridge()", self.device_qml)
-        self.assertNotIn("SettingsController.saveSettings()", self.device_qml)
-        self.assertNotIn("stopBridge", self.device_qml)
-        self.assertNotIn('text: qsTr("设备")', self.device_qml)
-        self.assertIn("SettingsController.activeRemoteLabel", self.device_qml)
-        self.assertIn('return qsTr("启动服务")', self.device_qml)
+            self.assertIn(f'objectName: "{button_name}"', self.settings_qml)
+        self.assertIn(
+            "onClicked: root.showFeedback(DeviceViewModel.bridgeAction())",
+            self.settings_qml,
+        )
+        self.assertIn("onClicked: DeviceViewModel.refresh()", self.settings_qml)
+        self.assertIn("text: DeviceViewModel.connectionCard.actionLabel", self.settings_qml)
+        self.assertIn("noteText: DeviceViewModel.batteryLabel", self.settings_qml)
+        self.assertIn("model: MaintenanceViewModel.preferences", self.settings_qml)
+        self.assertIn('text: qsTr("通用设置")', self.settings_qml)
+        self.assertIsNone(
+            re.search(r'(?<!title)text: qsTr\("设备"\)', self.settings_qml)
+        )
+        for forbidden in ("saveSettings", "stopBridge"):
+            self.assertNotIn(forbidden, self.panel_qml)
 
     def test_device_toggles_share_the_compact_accent_switch(self):
-        self.assertEqual(self.device_qml.count("CompactSwitch {"), 4)
-        self.assertNotIn("                    Switch {", self.device_qml)
+        import re
+
+        self.assertEqual(self.settings_qml.count("CompactSwitch {"), 3)
+        self.assertIsNone(re.search(r"(?<!Compact)Switch\s*\{", self.settings_qml))
         self.assertIn("implicitWidth: 28", self.compact_switch_qml)
         self.assertIn("implicitHeight: 14", self.compact_switch_qml)
         self.assertIn("? root.tokens.accent", self.compact_switch_qml)
@@ -13148,146 +12533,118 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
 
     def test_sidebar_separator_uses_a_visible_structural_divider(self):
         navigation_source = self.main_qml[
-            self.main_qml.index('id: navigationBar'):
-            self.main_qml.index('id: pageStack')
+            self.main_qml.index("id: navigationBar"):
+            self.main_qml.index("id: pageStack")
         ]
         self.assertIn("width: tokens.structuralDividerWidth", navigation_source)
         self.assertIn("color: tokens.borderStrong", navigation_source)
 
     def test_diagnostics_are_reused_inside_their_own_rows(self):
-        for check_id in ("os_version", "raw_input", "ble_candidate"):
-            self.assertIn(f'"{check_id}"', self.device_qml)
+        self.assertEqual(self.settings_qml.count("DiagnosticResultRow {"), 2)
+        self.assertEqual(
+            self.settings_qml.count(
+                "statusText: root.checkStatusLabel(modelData.status)"
+            ),
+            2,
+        )
+        self.assertIn("onClicked: DeviceViewModel.refresh()", self.settings_qml)
         for check_id in (
+            "os_version",
+            "raw_input",
+            "ble_candidate",
             "vb_cable_endpoints",
             "output_endpoint",
         ):
-            self.assertIn(f'"{check_id}"', self.voice_qml)
-        self.assertIn("DiagnosticsController.refreshDiagnostics()", self.device_qml)
+            self.assertNotIn(f'"{check_id}"', self.view_qml)
 
     def test_voice_page_has_device_specific_recording_rows_and_provider_content(self):
-        for object_name in (
-            "audioPrerequisiteSection",
-            "rc003RemoteRecordingModeRow",
-            "remoteRecordingModeRow",
-            "voiceProgramSection",
-            "voiceTestSection",
+        self.assertIn('objectName: "settingsVoiceSection"', self.settings_qml)
+        self.assertIn('titleText: qsTr("按键模式")', self.settings_qml)
+        self.assertIn('model: ["按住说话", "按一次开·再按一次关"]', self.settings_qml)
+        self.assertIn("VoiceViewModel.recordingMode", self.settings_qml)
+        self.assertIn("VoiceViewModel.setRecordingMode(", self.settings_qml)
+        self.assertIn("model: VoiceViewModel.voicePrograms", self.settings_qml)
+        self.assertIn("VoiceViewModel.setVoiceProgram(modelData.id)", self.settings_qml)
+        self.assertIn("VoiceViewModel.customProgramPath", self.settings_qml)
+        self.assertIn("VoiceViewModel.pickCustomProgramPath(", self.settings_qml)
+        self.assertIn('objectName: "settingsPickCustomProgramButton"', self.settings_qml)
+        self.assertIn("VoiceViewModel.autoLaunch", self.settings_qml)
+        self.assertIn("VoiceViewModel.setAutoLaunch(", self.settings_qml)
+        self.assertIn("VoiceViewModel.launchElevated", self.settings_qml)
+        self.assertIn("VoiceViewModel.setLaunchElevated(", self.settings_qml)
+        self.assertIn('objectName: "settingsLaunchVoiceProgramButton"', self.settings_qml)
+        self.assertIn("VoiceViewModel.launchVoiceProgram()", self.settings_qml)
+        self.assertIn('objectName: "settingsOpenVoiceProgramSettingsButton"', self.settings_qml)
+        self.assertIn("VoiceViewModel.openVoiceProgramSettings()", self.settings_qml)
+        self.assertIn('objectName: "settingsSetRecordingLimitButton"', self.settings_qml)
+        self.assertIn("VoiceViewModel.recordingLimitSeconds", self.settings_qml)
+        self.assertIn("VoiceViewModel.setRecordingLimit(", self.settings_qml)
+        self.assertIn('objectName: "settingsStartHotkeyCaptureButton"', self.settings_qml)
+        for retired in (
+            "voiceProgramWindowsDictationSelected",
+            "selectedVoiceProgramIndex",
+            'objectName: "voiceProgramStatusRefreshTimer"',
         ):
-            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
-        self.assertIn("visible: SettingsController.isRc003Device", self.voice_qml)
-        self.assertIn("visible: !SettingsController.isRc003Device", self.voice_qml)
-        rc003_recording_block = self.voice_qml.split(
-            'objectName: "rc003RemoteRecordingModeRow"', 1
-        )[1].split('objectName: "remoteRecordingModeRow"', 1)[0]
-        self.assertIn('titleText: qsTr("按键模式")', rc003_recording_block)
-        self.assertIn('descriptionText: qsTr("仅支持按住型")', rc003_recording_block)
-        self.assertNotIn("SelectionComboBox", rc003_recording_block)
-        self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
-        self.assertIn('objectName: "voiceProgramCustomPathRow"', self.voice_qml)
-        self.assertIn('objectName: "recordVoiceHotkeyButton"', self.voice_qml)
-        self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
-        self.assertNotIn("voiceProgramWindowsDictationSelected", self.voice_qml)
-        self.assertIn(
-            "SettingsController.voiceProgramCustomSelected",
-            self.voice_qml,
-        )
-        self.assertNotIn("selectedVoiceProgramIndex ===", self.voice_qml)
-        self.assertIn(
-            "SettingsController.refreshVoiceHotkeyFromProvider()", self.voice_qml
-        )
-        self.assertIn(
-            "SettingsController.loadVoiceHotkeyFromProvider()", self.voice_qml
-        )
-        self.assertNotIn('objectName: "voiceProgramStatusRefreshTimer"', self.voice_qml)
-        self.assertIn("readonly property bool voiceHotkeyBusy", self.voice_qml)
+            self.assertNotIn(retired, self.view_qml)
 
     def test_voice_audio_rows_auto_save_and_keep_manual_privacy_only(self):
-        for object_name in (
-            "installVirtualAudioButton",
-            "endpointCombo",
-            "applyVirtualAudioButton",
-            "openMicrophonePrivacyButton",
-            "microphonePrivacyRow",
+        self.assertIn("model: VoiceViewModel.outputEndpoints", self.settings_qml)
+        self.assertEqual(self.view_qml.count("VoiceViewModel.selectOutput(modelData.id)"), 1)
+        self.assertIn('objectName: "settingsInstallVirtualCableButton"', self.settings_qml)
+        self.assertIn("VoiceViewModel.installVirtualCable()", self.settings_qml)
+        self.assertIn('objectName: "settingsMicrophonePrivacyLink"', self.settings_qml)
+        self.assertEqual(
+            self.view_qml.count("MaintenanceViewModel.openMicrophonePrivacySettings()"),
+            1,
+        )
+        for retired in (
+            'objectName: "applyVirtualAudioButton"',
+            'objectName: "endpointCombo"',
+            'objectName: "openSoundInputSettingsButton"',
+            'text: qsTr("声音输入")',
         ):
-            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
-        self.assertIn("recommendedIndex: SettingsController.recommendedEndpointIndex", self.voice_qml)
-        self.assertIn(
-            "SettingsController.selectAndPersistOutputEndpointIndex(index)",
-            self.voice_qml,
-        )
-        self.assertIn(
-            "SettingsController.selectAndPersistOutputEndpointIndex(",
-            self.voice_qml,
-        )
-        self.assertIn('text: qsTr("选推荐端点")', self.voice_qml)
-        self.assertIn(
-            "SettingsController.selectedEndpointIndex",
-            self.voice_qml,
-        )
-        self.assertNotIn('text: qsTr("应用")', self.voice_qml)
-        self.assertNotIn("SettingsController.saveSettings()", self.voice_qml)
-        self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
-        self.assertNotIn('text: qsTr("声音输入")', self.voice_qml)
+            self.assertNotIn(retired, self.view_qml)
+        self.assertNotIn("SettingsController.saveSettings()", self.view_qml)
 
     def test_voice_channel_check_keeps_safe_service_recovery(self):
-        for object_name in (
-            "bridgeTestConfirmDialog",
-            "testVbCableChannelButton",
-            "recoverBridgeButton",
+        self.assertIn('objectName: "settingsTestAudioButton"', self.settings_qml)
+        self.assertIn("VoiceViewModel.testAudio()", self.settings_qml)
+        self.assertIn('qsTr("检查声音通路")', self.settings_qml)
+        self.assertIn('objectName: "settingsInstallVirtualCableButton"', self.settings_qml)
+        for retired in (
+            'objectName: "trySpeakingButton"',
+            'objectName: "bridgeTestConfirmDialog"',
+            'objectName: "recoverBridgeButton"',
+            "vbCableBridgeRecoveryNeeded",
+            "testVbCableChannelWithBridgeRestart",
         ):
-            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
-        self.assertIn(
-            "DiagnosticsController.testVbCableChannelWithBridgeRestart()",
-            self.voice_qml,
-        )
-        self.assertNotIn('objectName: "trySpeakingButton"', self.voice_qml)
-        self.assertIn('qsTr("检查虚拟声卡")', self.voice_qml)
-        self.assertIn("vbCableBridgeRecoveryNeeded", self.voice_qml)
+            self.assertNotIn(retired, self.view_qml)
+        self.assertNotIn("DiagnosticsController", self.view_qml)
 
     def test_button_page_keeps_real_cards_and_confirms_built_in_defaults(self):
-        self.assertIn("MappingCard {", self.buttons_qml)
-        self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
-        self.assertIn('objectName: "restoreMappingDefaultsDialog"', self.buttons_qml)
-        self.assertIn('text: qsTr("恢复内置默认")', self.buttons_qml)
-        self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
-        self.assertIn("并立即自动保存", self.buttons_qml)
-        detect_index = self.buttons_qml.index('objectName: "detectRealKeyButton"')
-        note_index = self.buttons_qml.index('objectName: "voiceGestureRestrictionText"')
+        self.assertEqual(self.keys_qml.count("MappingCard {"), 2)
+        self.assertIn('objectName: "restoreDefaultsDialog"', self.settings_qml)
+        self.assertIn('text: qsTr("恢复内置默认")', self.settings_qml)
+        confirm_dialog = self.settings_qml[
+            self.settings_qml.index("id: restoreDefaultsDialog"):
+            self.settings_qml.index("id: deletePresetDialog")
+        ]
+        self.assertIn("standardButtons: Dialog.Ok | Dialog.Cancel", confirm_dialog)
+        self.assertIn("onAccepted: MappingViewModel.restoreDefaults()", confirm_dialog)
+        self.assertIn("所有按键动作将恢复为内置默认值。", confirm_dialog)
+        detect_index = self.keys_qml.index('objectName: "detectRealKeyButton"')
+        note_index = self.keys_qml.index("语音键在语音模式下暂停双击 / 长按。")
         self.assertLess(detect_index, note_index)
-        self.assertIn("SettingsController.isRc003Device ? SettingsController.keyDetectionText", self.buttons_qml)
-        self.assertIn(
-            "if (!SettingsController.startMappingHotkeyCapture()",
-            self.buttons_qml,
-        )
-        self.assertIn(
-            'objectName: "shortcutRecorderCaptureModeButton"',
-            self.buttons_qml,
-        )
-        self.assertIn(
-            'objectName: "shortcutRecorderManualModeButton"',
-            self.buttons_qml,
-        )
-        self.assertIn(
-            'objectName: "shortcutRecorderManualField"',
-            self.buttons_qml,
-        )
-        self.assertIn(
-            "SettingsController.normalizeMappingHotkeyText(",
-            self.buttons_qml,
-        )
-        self.assertIn(
-            'placeholderText: qsTr("例如 Ctrl+[、Win+L 或 左 Ctrl+←")',
-            self.buttons_qml,
-        )
-        self.assertRegex(
-            self.buttons_qml,
-            r'(?s)text: qsTr\("取消"\).*?'
-            r'onClicked: shortcutRecorder\.requestClose\(\)',
-        )
-        self.assertNotIn(
-            "SettingsController.keyDetectionActive\n"
-            "                                ? SettingsController.keyDetectionText",
-            self.buttons_qml,
-        )
+        self.assertIn("MappingViewModel.keyDetectionText", self.keys_qml)
+        self.assertIn("MappingViewModel.startKeyDetection()", self.keys_qml)
+        self.assertIn("MappingViewModel.captureShortcut()", self.keys_qml)
+        self.assertIn("MappingViewModel.stopShortcutCapture()", self.keys_qml)
+        self.assertIn('objectName: "shortcutRecorderDialog"', self.keys_qml)
+        self.assertIn('title: qsTr("录入快捷键")', self.keys_qml)
+        self.assertIn("onRejected: root.finishRecorder()", self.keys_qml)
+        self.assertIn('objectName: "shortcutRecorderCloseButton"', self.keys_qml)
+        self.assertIn("onClicked: root.finishRecorder()", self.keys_qml)
+        self.assertIn("function onShortcutCaptured(text)", self.keys_qml)
         self.assertIn('qsTr("语音模式下暂停")', self.mapping_card_qml)
 
     def test_inline_rows_do_not_restore_the_old_blue_circle_icon(self):
@@ -13297,10 +12654,6 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("descriptionText", self.inline_row_qml)
         self.assertIn("stateText", self.inline_row_qml)
 
-    def test_inline_diagnostic_notes_strip_terminal_sentence_marks(self):
-        normalization = 'replace(/[。；;]+$/, "")'
-        self.assertIn(normalization, self.voice_qml)
-        self.assertNotIn(normalization, self.device_qml)
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -13371,6 +12724,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(data["result"], 0)
+        self.assertFalse(data["visible_before_exit"])
         self.assertLess(data["elapsed"], 5.0)
 
     def test_default_window_close_hides_to_the_notification_area(self):
@@ -13398,7 +12752,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         data = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(data["action"], "window_close_hide")
         self.assertEqual(data["result"], 0)
-        self.assertFalse(data["visible_after_close"])
+        self.assertIs(data["visible_after_close"], False)
         self.assertGreater(data["elapsed"], 0.25)
         self.assertLess(data["elapsed"], 5.0)
 
@@ -13429,7 +12783,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         self.assertEqual(data["result"], 0)
         self.assertLess(data["elapsed"], 5.0)
 
-    def test_mixed_mapping_and_endpoint_draft_keeps_the_exit_prompt(self):
+    def test_mixed_mapping_and_endpoint_draft_goes_through_the_save_on_exit_decision(self):
         import subprocess
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -13453,8 +12807,16 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(data["action"], "window_close_quit_mixed_dirty")
-        self.assertTrue(data["visible_after_close"])
-        self.assertTrue(data["unsaved_dialog"])
+        self.assertIs(data["visible_after_close"], False)
+        # The retired three-way exit prompt (D7) is replaced by the typed
+        # save-on-exit decision: closing with a mixed mapping+endpoint draft
+        # must run that decision exactly once, dispatch exactly one exit
+        # path from it, and never write the endpoint draft behind the user's
+        # back before the exit completes.
+        self.assertEqual(data["decision_checks"], 1)
+        self.assertEqual(
+            data["save_then_exit_calls"] + data["request_exit_calls"], 1
+        )
         self.assertEqual(data["saved_endpoint_name"], "")
         self.assertEqual(data["result"], 0)
 
@@ -13482,7 +12844,7 @@ class ApplicationExitIntegrationTests(unittest.TestCase):
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(data["action"], "window_close_quit_running_bridge")
-        self.assertFalse(data["visible_during_cleanup"])
+        self.assertIs(data["visible_during_cleanup"], False)
         self.assertGreater(data["elapsed"], 0.5)
         self.assertLess(data["elapsed"], 5.0)
 
@@ -13531,24 +12893,15 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         )
         self.assertFalse(data["initial_settings_dirty"])
         self.assertFalse(data["retired_finish_tap_control_exists"])
-        self.assertFalse(data["voice_hotkey_recording"])
-        self.assertEqual(
-            data["hotkey_before_stop_completed"],
-            data["hotkey_before_capture"],
-        )
-        self.assertTrue(data["recording_before_stop_completed"])
-        self.assertEqual(data["pending_before_stop_completed"], "ctrl+shift+f8")
+        self.assertTrue(data["expected_hotkey_label"])
+        self.assertEqual(data["hotkey_label"], data["expected_hotkey_label"])
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
         self.assertIn("快捷键已保存到VCVR", data["voice_save_status"])
-        self.assertFalse(data["voice_feedback_on_device"])
-        self.assertTrue(data["voice_feedback_on_voice"])
-        self.assertTrue(data["mapping_dirty_on_buttons"])
-        self.assertFalse(data["mapping_dirty_on_voice"])
         self.assertTrue(data["hidden_before_restore"])
         self.assertTrue(data["restored_by_request"])
         self.assertTrue(data["hidden_after_second_close"])
 
-    def test_application_update_dialog_fits_and_restores_focus(self):
+    def test_update_states_surface_and_dialog_fit_and_restore_focus(self):
         import json
         import subprocess
 
@@ -13586,50 +12939,43 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertTrue(data["tab_backward"])
                 self.assertTrue(data["focus_restored"])
 
-                available = data["available"]
-                dialog = available["dialog"]
+                dialog = data["dialog"]
                 self.assertTrue(dialog["visible"])
                 self.assertGreaterEqual(dialog["x"], -0.5)
                 self.assertGreaterEqual(dialog["y"], -0.5)
                 self.assertLessEqual(dialog["right"], width + 0.5)
                 self.assertLessEqual(dialog["bottom"], height + 0.5)
-                self.assertEqual(available["title"], "发现新版本")
-                self.assertIn("0.2.0-candidate.16", available["version"])
-                self.assertIn("便携版 ZIP", available["package"])
-                self.assertTrue(available["notes"]["visible"])
-                self.assertTrue(available["close"]["visible"])
-                self.assertTrue(available["release"]["visible"])
-                self.assertTrue(available["download"]["visible"])
-                self.assertLessEqual(
-                    available["close"]["right"],
-                    available["release"]["x"] + 0.5,
-                )
-                self.assertLessEqual(
-                    available["release"]["right"],
-                    available["download"]["x"] + 0.5,
-                )
+
+                available = data["available"]
+                self.assertEqual(available["title"], "软件更新")
+                self.assertIn("0.2.0-candidate.16", available["subtitle"])
+                self.assertEqual(available["tone"], "warn")
+                self.assertEqual(available["action_label"], "下载更新")
+                self.assertEqual(available["action_text"], available["action_label"])
+                self.assertEqual(available["item_status"], "todo")
 
                 downloading = data["downloading"]
-                self.assertEqual(downloading["title"], "正在下载更新")
-                self.assertFalse(downloading["close_visible"])
-                self.assertFalse(downloading["download_visible"])
-                self.assertTrue(downloading["cancel"]["visible"])
-                self.assertTrue(downloading["progress_visible"])
-                self.assertAlmostEqual(downloading["progress"], 0.5, delta=0.01)
+                self.assertEqual(downloading["title"], "软件更新")
+                self.assertEqual(downloading["detail"], "正在下载便携版 ZIP…")
+                self.assertEqual(downloading["tone"], "idle")
+                self.assertEqual(downloading["item_status"], "current")
+                self.assertTrue(downloading["cancel_visible"])
+                self.assertEqual(downloading["dispatched"], [])
 
                 download_error = data["download_error"]
-                self.assertEqual(download_error["title"], "下载更新失败")
-                self.assertTrue(download_error["download"]["visible"])
-                self.assertEqual(download_error["download_text"], "重新下载")
+                self.assertEqual(download_error["detail"], "连接 GitHub 超时，请稍后重试。")
+                self.assertEqual(download_error["tone"], "warn")
+                self.assertEqual(download_error["item_status"], "todo")
+                self.assertEqual(download_error["action_label"], "下载更新")
+                self.assertEqual(download_error["dispatched"], ["download"])
 
                 downloaded = data["downloaded"]
-                self.assertEqual(downloaded["title"], "更新包已下载")
-                self.assertTrue(downloaded["folder"]["visible"])
-                self.assertEqual(downloaded["folder_text"], "打开桌面")
-                self.assertTrue(downloaded["progress_visible"])
-                self.assertAlmostEqual(downloaded["progress"], 1.0, delta=0.001)
+                self.assertEqual(downloaded["detail"], "便携版已下载并通过校验。")
+                self.assertEqual(downloaded["tone"], "ok")
+                self.assertEqual(downloaded["item_status"], "done")
+                self.assertEqual(downloaded["dispatched"], ["open"])
 
-    def test_elevated_window_opens_without_the_first_hid_permission_prompt(self):
+    def test_elevated_window_shows_no_hid_nag_and_never_auto_elevates(self):
         import json
         import subprocess
 
@@ -13648,11 +12994,12 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertEqual(data["warnings"], [])
         self.assertTrue(data["window_visible"])
         self.assertFalse(data["dialog_visible"])
-        self.assertFalse(data["repair_visible"])
+        self.assertTrue(data["maintenance_folded"])
+        self.assertEqual(data["helper_fix_label"], "修复")
         self.assertEqual(data["install_call_count"], 0)
         self.assertFalse(data["saved_offer_id"])
 
-    def test_first_hid_permission_prompt_is_compact_clear_and_non_elevating(self):
+    def test_hid_permission_dialog_is_compact_clear_and_non_elevating(self):
         import json
         import subprocess
 
@@ -13680,20 +13027,15 @@ class OffscreenQmlLoadTests(unittest.TestCase):
 
         initial = data["initial"]
         self.assertTrue(initial["dialog_visible"])
-        self.assertEqual(initial["dialog_title"], "建议打开管理员按键权限")
-        self.assertIn("用于自定义改键和遥控器语音键", initial["body_text"])
-        self.assertIn("成功后普通启动和自启动不再询问", initial["body_text"])
-        self.assertIn("现在不打开时，只保留 Windows 原始按键", initial["body_text"])
+        self.assertEqual(initial["dialog_title"], "移除按键映射权限？")
+        self.assertEqual(
+            initial["body_text"],
+            "移除后，本机所有无线麦版本都不能使用自定义按键映射。",
+        )
         self.assertGreaterEqual(
             initial["body_height"] + 0.5,
             initial["body_implicit_height"],
         )
-        self.assertEqual(initial["decline_text"], "不打开")
-        self.assertTrue(initial["decline_flat"])
-        self.assertFalse(initial["decline_highlighted"])
-        self.assertEqual(initial["confirm_text"], "打开")
-        self.assertFalse(initial["confirm_flat"])
-        self.assertTrue(initial["confirm_highlighted"])
 
         def assert_inside(item, container):
             self.assertGreaterEqual(item["x"], container["x"] - 0.5)
@@ -13704,15 +13046,12 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         viewport = {"x": 0, "y": 0, "right": 640, "bottom": 480}
         assert_inside(initial["dialog"], viewport)
         assert_inside(initial["body"], initial["dialog"])
-        assert_inside(initial["decline"], initial["dialog"])
-        assert_inside(initial["confirm"], initial["dialog"])
-        self.assertLessEqual(initial["body"]["bottom"], initial["decline"]["y"] + 0.5)
-        self.assertLessEqual(initial["decline"]["right"], initial["confirm"]["x"] + 0.5)
 
+        self.assertIs(data["focus_restored"], True)
         self.assertTrue(data["dialog_reopened"])
-        self.assertTrue(data["repair_visible"])
+        self.assertEqual(data["helper_fix_label"], "修复")
         self.assertEqual(data["install_call_count"], 0)
-        self.assertEqual(data["saved_offer_id"], "4:" + ("a" * 64))
+        self.assertFalse(data["saved_offer_id"])
 
     def test_rc003_only_three_page_shell_is_rendered(self):
         import json
@@ -14299,261 +13638,9 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     130,
                 )
 
-    def _legacy_settings_shell_fits_supported_logical_viewports_without_horizontal_overflow(self):
-        import json
-        import subprocess
+    
 
-        # The compact default plus logical sizes corresponding to the
-        # supported physical viewports and small high-DPI fallbacks.
-        scenarios = (
-            ("Basic", 840, 720),
-            ("Basic", 1024, 720),
-            ("Basic", 1093, 614),
-            ("Basic", 1280, 720),
-            ("Basic", 683, 480),
-            ("Basic", 640, 480),
-            ("FluentWinUI3", 840, 720),
-            ("FluentWinUI3", 720, 464),
-            ("FluentWinUI3", 683, 480),
-            ("FluentWinUI3", 640, 480),
-            ("FluentWinUI3", 640, 440),
-        )
-
-        for style, width, height in scenarios:
-            with self.subTest(style=style, width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
-                env = dict(os.environ)
-                env.setdefault("QT_QPA_PLATFORM", "offscreen")
-                env["LOCALAPPDATA"] = tmpdir
-                env["PROBE_STYLE"] = style
-                env["PROBE_WIDTH"] = str(width)
-                env["PROBE_HEIGHT"] = str(height)
-                result = subprocess.run(
-                    [sys.executable, "-c", _SETTINGS_SHELL_LAYOUT_PROBE_SCRIPT],
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                self.assertEqual(
-                    result.returncode,
-                    0,
-                    "settings layout probe failed at "
-                    f"{width}x{height}: {result.stdout}\n{result.stderr}",
-                )
-                data = json.loads(result.stdout.strip().splitlines()[-1])
-                self.assertEqual(data["warnings"], [])
-                self.assertEqual((data["width"], data["height"]), (width, height))
-                self.assertTrue(data["initial_status_visible"])
-                self.assertFalse(data["initial_status_has_status"])
-                self.assertTrue(data["initial_status_text_visible"])
-                self.assertEqual(
-                    data["initial_status_text"],
-                    "黄色或红色表示仍需处理，请按状态提示操作；需要处理的项目变为绿色后即可使用。",
-                )
-                self.assertEqual(
-                    data["connection"]["explicit_launch_status"],
-                    "AUDIT_LAUNCH_RESULT_MUST_BE_VISIBLE",
-                )
-                self.assertEqual(
-                    data["diagnostics"]["detail_before_refresh"],
-                    "AUDIT_DETAIL_FIRST",
-                )
-                self.assertEqual(
-                    data["diagnostics"]["detail_after_refresh"],
-                    "AUDIT_DETAIL_AFTER_REFRESH",
-                )
-
-                for group_name in ("navigation",):
-                    for item_name, item in data[group_name].items():
-                        self.assertGreater(item["width"], 0, item_name)
-                        self.assertGreaterEqual(item["x"], -1, item_name)
-                        self.assertLessEqual(item["right"], width + 1, item_name)
-
-                for page_name in ("connection", "permissions", "diagnostics"):
-                    page = data[page_name]
-                    self.assertLessEqual(
-                        page["content_width"], page["available_width"] + 1
-                    )
-                    for item_name, item in page["items"].items():
-                        if not item["visible"]:
-                            continue
-                        self.assertGreater(item["width"], 0, item_name)
-                        self.assertGreaterEqual(item["x"], -1, item_name)
-                        self.assertLessEqual(item["right"], width + 1, item_name)
-
-                diagnostics_items = data["diagnostics"]["items"]
-                self.assertLessEqual(
-                    data["diagnostics"]["content_height"],
-                    data["diagnostics"]["available_height"] + 1,
-                )
-                for first_name, second_name, section_name in (
-                    (
-                        "selectCableInputButton",
-                        "launchDriverSetupButton",
-                        "optionalDriverSection",
-                    ),
-                    (
-                        "openSpeechSettingsButton",
-                        "diagnosticsOpenLogButton",
-                        "diagnosticsFooterSection",
-                    ),
-                ):
-                    first = diagnostics_items[first_name]
-                    second = diagnostics_items[second_name]
-                    section = diagnostics_items[section_name]
-                    self.assertAlmostEqual(first["width"], second["width"], delta=1)
-                    self.assertAlmostEqual(first["height"], second["height"], delta=1)
-                    self.assertAlmostEqual(first["y"], second["y"], delta=1)
-                    self.assertLess(first["right"], second["x"])
-                    self.assertGreaterEqual(first["x"], section["x"])
-                    self.assertLessEqual(second["right"], section["right"])
-
-                for description_name, action_name, section_name in (
-                    (
-                        "optionalDriverDescription",
-                        "selectCableInputButton",
-                        "optionalDriverSection",
-                    ),
-                    (
-                        "vbCableChannelDescription",
-                        "testVbCableChannelButton",
-                        "vbCableChannelTestSection",
-                    ),
-                    (
-                        "diagnosticsFooterDescription",
-                        "openSpeechSettingsButton",
-                        "diagnosticsFooterSection",
-                    ),
-                ):
-                    description = diagnostics_items[description_name]
-                    action = diagnostics_items[action_name]
-                    section = diagnostics_items[section_name]
-                    self.assertGreaterEqual(description["y"], section["y"])
-                    self.assertLessEqual(description["bottom"], section["bottom"] - 1)
-                    self.assertLess(description["right"], action["x"])
-
-                mapping_items = data["mapping"]["items"]
-                for item_name, item in mapping_items.items():
-                    if not item["visible"]:
-                        continue
-                    self.assertGreater(item["width"], 0, item_name)
-                    self.assertGreaterEqual(item["x"], -1, item_name)
-                    self.assertLessEqual(item["right"], width + 1, item_name)
-                self.assertLess(
-                    mapping_items["mappingActionsPanel"]["y"],
-                    mapping_items["mappingList"]["y"],
-                )
-                self.assertLess(
-                    mapping_items["mappingList"]["y"],
-                    mapping_items["mappingListFrame"]["y"],
-                )
-                for canvas_name in ("mappingLines", "activeMappingLine"):
-                    canvas = mapping_items[canvas_name]
-                    board = mapping_items["mappingList"]
-                    self.assertAlmostEqual(canvas["x"], board["x"], delta=1)
-                    self.assertAlmostEqual(canvas["y"], board["y"], delta=1)
-                    self.assertAlmostEqual(canvas["width"], board["width"], delta=1)
-                    self.assertAlmostEqual(canvas["height"], board["height"], delta=1)
-                self.assertLessEqual(
-                    mapping_items["leftMappingCards"]["right"],
-                    mapping_items["photoSidebar"]["x"],
-                )
-                self.assertLessEqual(
-                    mapping_items["photoSidebar"]["right"],
-                    mapping_items["rightMappingCards"]["x"],
-                )
-                connection_items = data["connection"]["items"]
-                if width == 840:
-                    for combo_name in ("deviceCombo", "endpointCombo"):
-                        combo = connection_items[combo_name]
-                        section = connection_items["rc003OutputSection"]
-                        self.assertGreaterEqual(
-                            combo["width"], section["width"] - 100
-                        )
-                        self.assertLessEqual(combo["x"] - section["x"], 90)
-                        self.assertLessEqual(
-                            section["right"] - combo["right"], 50
-                        )
-                self.assertTrue(connection_items["bridgeNotRunningWarning"]["visible"])
-                self.assertIn("语音键", data["connection"]["bridge_warning"])
-                self.assertNotIn(
-                    "未运行",
-                    data["connection"]["warning_after_external_start"],
-                )
-                self.assertIn(
-                    "未运行",
-                    data["connection"]["warning_after_external_exit"],
-                )
-                self.assertLessEqual(
-                    connection_items["deviceSection"]["right"],
-                    connection_items["rc003OutputSection"]["x"],
-                )
-                self.assertAlmostEqual(
-                    connection_items["deviceSection"]["y"],
-                    connection_items["rc003OutputSection"]["y"],
-                    delta=1,
-                )
-                self.assertLess(
-                    connection_items["deviceCombo"]["y"],
-                    connection_items["endpointCombo"]["y"],
-                )
-                self.assertLess(
-                    connection_items["endpointCombo"]["y"],
-                    connection_items["bridgeSection"]["y"],
-                )
-                self.assertLess(
-                    connection_items["bridgeSection"]["y"],
-                    connection_items["connectionActionRow"]["y"],
-                )
-                self.assertFalse(data["connection"]["save_highlighted"])
-                self.assertTrue(data["connection"]["launch_highlighted"])
-                self.assertNotIn("小米遥控器2 Pro 已连接", data["connection"]["launch_status"])
-                waiting_progress = data["connection"]["waiting_progress"]
-                self.assertTrue(waiting_progress["visible"])
-                self.assertTrue(waiting_progress["indicator_running"])
-                self.assertIn("等待小米遥控器2 Pro 连接", waiting_progress["stage_text"])
-                self.assertTrue(waiting_progress["elapsed_visible"])
-                self.assertEqual(waiting_progress["elapsed_text"], "12 秒")
-                connected_progress = data["connection"]["connected_progress"]
-                self.assertTrue(connected_progress["visible"])
-                self.assertFalse(connected_progress["indicator_running"])
-                self.assertIn("小米遥控器2 Pro 已连接", connected_progress["stage_text"])
-
-                permission_items = data["permissions"]["items"]
-                self.assertTrue(permission_items["requiredPermissionsSection"]["visible"])
-                self.assertTrue(data["neutral_status"]["visible"])
-                self.assertEqual(data["neutral_status"]["text"], "neutral status")
-                self.assertTrue(data["error_status"]["visible"])
-                self.assertEqual(data["error_status"]["text"], "priority error")
-
-    def _legacy_tab_focus_scrolls_connection_and_permissions_commands_into_view(self):
-        import json
-        import subprocess
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            env = dict(os.environ)
-            env.setdefault("QT_QPA_PLATFORM", "offscreen")
-            env["LOCALAPPDATA"] = tmpdir
-            result = subprocess.run(
-                [sys.executable, "-c", _TAB_FOCUS_SCROLL_PROBE_SCRIPT],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"Tab focus probe failed: {result.stdout}\n{result.stderr}",
-        )
-        data = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(data["warnings"], [])
-        for page_name in ("connection", "permissions"):
-            page = data[page_name]
-            self.assertTrue(page["reached"], page_name)
-            self.assertTrue(page["escaped"], page_name)
-            self.assertGreaterEqual(page["content_y"], 0, page_name)
-            self.assertTrue(page["target_visible"], page_name)
+    
 
 
 class QmlLoadProbeCallsProductionShutdownHelperTests(unittest.TestCase):

@@ -1,0 +1,69 @@
+{
+  "close_behavior": "hide_to_tray",
+  "diagnostic_trace_enabled": false,
+  "gain_db": 10.0,
+  "hid_helper_setup_prompted_offer_id": "",
+  "launch_bridge_on_app_start": false,
+  "max_retry_delay": 60.0,
+  "output_endpoint_host_api": "",
+  "output_endpoint_name": "",
+  "remote_recording_limit_seconds": 120,
+  "remote_recording_mode": "toggle",
+  "remote_selection": {
+    "active": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "devices": [
+      {
+        "key": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "profile": "chromecast-remote"
+      }
+    ],
+    "schema": 1
+  },
+  "retry_delay": 5.0,
+  "schema_version": 17,
+  "voice_hotkey": "lctrl+a",
+  "voice_hotkeys": {
+    "hold": "lctrl+a"
+  },
+  "voice_hotkeys_by_provider": {
+    "chatterfly": {
+      "hold": "",
+      "source": "default"
+    },
+    "custom": {
+      "hold": "ralt",
+      "source": "default"
+    },
+    "doubao_ime": {
+      "hold": "lctrl+a",
+      "source": "manual",
+      "toggle": "lctrl+b",
+      "toggle_source": "manual"
+    },
+    "none": {
+      "hold": "ralt",
+      "source": "default"
+    },
+    "sogou": {
+      "hold": "rctrl",
+      "source": "default"
+    },
+    "wetype": {
+      "hold": "lctrl+lwin",
+      "source": "default"
+    }
+  },
+  "voice_program": {
+    "custom_executable": "",
+    "launch_elevated": false,
+    "launch_elevated_by_provider": {
+      "custom": false,
+      "sogou": true
+    },
+    "launch_on_bridge_start": false,
+    "launch_on_bridge_start_by_provider": {},
+    "provider": "doubao_ime"
+  },
+  "voice_shortcut_enabled": true,
+  "voice_trigger_mode": "hold"
+}

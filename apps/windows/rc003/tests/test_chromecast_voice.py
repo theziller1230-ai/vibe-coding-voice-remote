@@ -1155,7 +1155,7 @@ class DeviceVoiceLayoutTests(unittest.IsolatedAsyncioTestCase):
 class VoicePageTests(unittest.TestCase):
     def test_recording_selection_matches_saved_mode_after_busy_and_failure(self):
         from tests.test_remote_selection import _QML_PROBE
-        bootstrap = _QML_PROBE.split("def click(name):")[0]
+        bootstrap = _QML_PROBE.split('# == shared journey marker ==')[0]
         bootstrap = bootstrap.replace("model = classes['ButtonMappingModel']()", """
 settings = m.config.default_config()
 settings[selection.KEY] = {'schema': 1, 'active': B, 'devices': [{'key': B, 'profile': 'chromecast-remote'}]}
@@ -1167,41 +1167,54 @@ model = classes['ButtonMappingModel']()
         probe = bootstrap + r'''
 from PySide6.QtTest import QTest
 from PySide6.QtCore import Qt
-item('voicePageLoader').setProperty('active', True)
-assert QMetaObject.invokeMethod(item('voiceTabButton'), 'pressed')
-for _ in range(12):
-    app.processEvents()
-    window.grabWindow()
-mode, limit = item('remoteRecordingModeCombo'), item('remoteRecordingLimitCombo')
-engine.globalObject().setProperty('modeProbe', engine.newQObject(mode))
-engine.globalObject().setProperty('limitProbe', engine.newQObject(limit))
-def js(code):
-    result = engine.evaluate(code)
-    assert not result.isError(), result.toString()
-    app.processEvents()
+vm = _viewmodels.VoiceViewModel
+nav('settingsTabButton')
+click('settingsVoiceSection_foldToggle')
+settle()
+voice_section = item('settingsVoiceSection')
+combos = find_all(voice_section, lambda node: node.metaObject().indexOfProperty('displayText') >= 0
+                  and node.metaObject().indexOfProperty('count') >= 0)
+assert len(combos) == 1, [class_name(node) for node in combos]
+mode_combo = combos[0]
+limit_fields = find_all(voice_section, lambda node: node.metaObject().indexOfProperty('placeholderText') >= 0
+                        and node.metaObject().indexOfProperty('validator') >= 0
+                        and node.property('validator') is not None)
+assert len(limit_fields) == 1, [class_name(node) for node in limit_fields]
+limit_field = limit_fields[0]
+assert mode_combo.property('count') == 2
+limits = (60, 120, 180, 300, 600)
+
 def check(expected_mode, expected_limit=1):
     saved = m.config.load_config(m.config.config_path())
     assert controller.remoteRecordingModeIndex == expected_mode
-    assert mode.property('currentIndex') == expected_mode
-    assert limit.property('currentIndex') == expected_limit
+    assert vm.recordingMode == ('按一次开·再按一次关' if expected_mode else '按住说话')
+    assert vm.recordingLimitSeconds == limits[expected_limit]
     assert saved['remote_recording_mode'] == ('toggle' if expected_mode else 'hold')
-    assert saved['remote_recording_limit_seconds'] == (60, 120, 180, 300, 600)[expected_limit]
+    assert saved['remote_recording_limit_seconds'] == limits[expected_limit]
+    assert mode_combo.property('currentIndex') == expected_mode
+    assert int(limit_field.property('text')) == limits[expected_limit]
+
+def focus_type(widget, text):
+    QMetaObject.invokeMethod(widget, 'forceActiveFocus')
+    QTest.keyClick(window, Qt.Key.Key_A, Qt.ControlModifier)
+    for character in text:
+        QTest.keyClick(window, Qt.Key(ord(character.upper())))
+    app.processEvents()
+
 check(1)
-# A shortcut read must disable both selectors, including an already-open popup.
-js('modeProbe.popup.open()')
+# A shortcut read blocks recording changes: an in-flight selection is refused
+# and the saved mode is preserved.
 controller._set_voice_hotkey_busy(True)
 app.processEvents()
-assert not mode.property('enabled')
-assert not limit.property('enabled')
-# Deliver a selection that was already in flight when the blocker appeared.
-js('modeProbe.currentIndex = 0; modeProbe.activated(0); modeProbe.popup.close()')
+QMetaObject.invokeMethod(mode_combo, 'forceActiveFocus')
+QTest.keyClick(window, Qt.Key.Key_Up)
+app.processEvents()
+assert controller.errorMessage == '当前无法更改录音设置，原设置已保留；请稍后重试。'
 check(1)
-assert controller.errorMessage
 controller._set_voice_hotkey_busy(False)
 app.processEvents()
-assert mode.property('enabled')
 # Exercise actual ComboBox key handling, not just the controller setter.
-mode.forceActiveFocus()
+QMetaObject.invokeMethod(mode_combo, 'forceActiveFocus')
 QTest.keyClick(window, Qt.Key.Key_Up)
 app.processEvents()
 check(0)
@@ -1210,13 +1223,19 @@ app.processEvents()
 check(1)
 # Save failure must restore both selectors and leave their bindings live.
 with mock.patch.object(m.config, 'save_config_and_load', side_effect=OSError('test disk failure')):
-    js('modeProbe.currentIndex = 0; modeProbe.activated(0)')
+    QMetaObject.invokeMethod(mode_combo, 'forceActiveFocus')
+    QTest.keyClick(window, Qt.Key.Key_Up)
+    app.processEvents()
     check(1)
     assert '保存失败' in controller.errorMessage
-    js('limitProbe.currentIndex = 0; limitProbe.activated(0)')
+    focus_type(limit_field, '60')
+    click('settingsSetRecordingLimitButton')
+    app.processEvents()
     check(1)
     assert '保存失败' in controller.errorMessage
-js('limitProbe.currentIndex = 0; limitProbe.activated(0)')
+focus_type(limit_field, '60')
+click('settingsSetRecordingLimitButton')
+app.processEvents()
 check(1, 0)
 controller.setRemoteRecordingPreferences(0, 1)
 app.processEvents()
@@ -1250,7 +1269,7 @@ assert not warnings, warnings
         # Reuse only the shell bootstrap, not the independently changing device
         # chooser journey. Persist a synthetic selected entity in a temp root.
         from tests.test_remote_selection import _QML_PROBE
-        bootstrap = _QML_PROBE.split("def click(name):")[0]
+        bootstrap = _QML_PROBE.split('# == shared journey marker ==')[0]
         bootstrap = bootstrap.replace("model = classes['ButtonMappingModel']()", """
 settings = m.config.default_config()
 settings[selection.KEY] = {'schema': 1, 'active': B, 'devices': [{'key': B, 'profile': 'chromecast-remote'}]}
@@ -1260,8 +1279,8 @@ model = classes['ButtonMappingModel']()
 """)
         bootstrap = bootstrap.replace("['provider'] = 'wetype'", "['provider'] = " + repr(provider))
         probe = bootstrap + r'''
-def settle():
-    deadline = time.monotonic() + 3
+def settle_within(seconds=3):
+    deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         app.processEvents()
         window.grabWindow()
@@ -1269,31 +1288,50 @@ def settle():
             return
         time.sleep(.01)
     assert not controller.voiceHotkeyBusy
-item('voicePageLoader').setProperty('active', True)
-assert QMetaObject.invokeMethod(item('voiceTabButton'), 'pressed')
-for _ in range(12):
-    app.processEvents()
-    window.grabWindow()
-assert controller.activeRemoteProfile == 'chromecast-remote'
-assert not item('voicePageLoader').property('item').property('voiceProgramUnsupported')
-assert item('voiceHotkeyRow').property('visible')
-assert item('refreshVoiceHotkeyButton').property('visible')
-assert item('recordVoiceHotkeyButton').property('visible')
-assert not item('voiceProgramAutoStartRow').property('visible')
-row = item('remoteRecordingModeRow')
-program = item('voiceProgramSection')
-selection = item('voiceProgramSelectionRow')
-assert row.parentItem() == selection.parentItem()
-assert selection.y() + selection.height() <= row.y()
-assert row.property('titleText') == '按键模式'
-assert item('remoteRecordingModeRow_titleLabel').property('font').weight() == 500
-assert item('voiceProgramSelectionRow_titleLabel').property('font').weight() == 500
-controller.setRemoteRecordingPreferences(1, 1)
+vm = _viewmodels.VoiceViewModel
+mapping_vm = _viewmodels.MappingViewModel
+nav('settingsTabButton')
+click('settingsVoiceSection_foldToggle')
 settle()
+voice_section = item('settingsVoiceSection')
+assert controller.activeRemoteProfile == 'chromecast-remote'
+# The voice program chooser is present and usable for this remote.
+assert len(vm.voicePrograms) > 0, vm.voicePrograms
+label_rows = find_all(voice_section, lambda node: node.metaObject().indexOfProperty('labelText') >= 0)
+assert len(label_rows) >= len(vm.voicePrograms), (len(label_rows), len(vm.voicePrograms))
+# The hotkey row keeps its capture controls.
+assert item('settingsStartHotkeyCaptureButton').property('visible')
+assert item('settingsStopHotkeyCaptureButton').property('visible')
+combos = find_all(voice_section, lambda node: node.metaObject().indexOfProperty('displayText') >= 0
+                  and node.metaObject().indexOfProperty('count') >= 0)
+assert len(combos) == 1, [class_name(node) for node in combos]
+mode_combo = combos[0]
+limit_fields = find_all(voice_section, lambda node: node.metaObject().indexOfProperty('placeholderText') >= 0
+                        and node.metaObject().indexOfProperty('validator') >= 0
+                        and node.property('validator') is not None)
+assert len(limit_fields) == 1, [class_name(node) for node in limit_fields]
+limit_field = limit_fields[0]
+# The recording-mode row is labelled "按键模式" and sits below the voice
+# program rows in the same section column.
+mode_rows = find_all(voice_section, lambda node: node.metaObject().indexOfProperty('titleText') >= 0
+                     and node.metaObject().indexOfProperty('noteText') >= 0
+                     and node.property('titleText') == '按键模式')
+assert len(mode_rows) == 1, [class_name(node) for node in mode_rows]
+mode_row = mode_rows[0]
+assert mode_row.parentItem() == label_rows[0].parentItem(), (class_name(mode_row), class_name(label_rows[0]))
+assert mode_row.property('y') > label_rows[0].property('y'), (mode_row.property('y'), label_rows[0].property('y'))
+# Compact row titles keep the Medium weight.
+settings_titles = find_all(voice_section, lambda node: class_name(node).startswith('UiLabel')
+                           and node.property('text') == '随遥控器服务启动')
+assert settings_titles, '随遥控器服务启动'
+assert all(node.property('font').weight() == 500 for node in settings_titles)
+controller.setRemoteRecordingPreferences(1, 1)
+settle_within()
 app.processEvents()
-assert item('remoteRecordingLimitCombo').property('visible')
 assert controller.remoteRecordingLimitIndex == 1
-assert row.property('descriptionText') == '按一下开始，再按结束；到时停止遥控音频'
+assert vm.recordingMode == '按一次开·再按一次关'
+assert vm.recordingLimitSeconds == 120
+assert limit_field.property('visible')
 assert controller.holdVoiceHotkeyText == ''  # Never reuse Ctrl+Win as a toggle.
 from ovb_rc003 import key_mapping
 held_shortcut = m.config.voice_hotkey_for_provider(controller._config, 'wetype')
@@ -1304,35 +1342,20 @@ assert controller.voiceHotkeySource == 'manual'
 assert m.config.voice_hotkey_for_provider(controller._config, 'wetype') == held_shortcut
 saved = m.config.load_config(m.config.config_path())
 assert m.config.voice_hotkey_for_provider(saved, 'wetype', trigger='toggle') == 'lshift+f9'
+assert vm.hotkeyLabel == controller.formatHotkeyText('lshift+f9')
 restored = classes['SettingsController'](classes['ButtonMappingModel'](), background_task_runner=lambda target, name: target())
 assert restored.holdVoiceHotkeyText == 'lshift+f9'
 restored.shutdownBackgroundTasks()
-for _ in range(8):
-    app.processEvents()
-    window.grabWindow()
-mode, limit = item('remoteRecordingModeCombo'), item('remoteRecordingLimitCombo')
-assert mode.parentItem() == limit.parentItem()
-assert abs(mode.y() - limit.y()) < 1
-assert 0 < limit.x() - mode.x() - mode.width() <= 16
-assert 50 <= mode.width() < 92, (window.width(), mode.width(), limit.width())
-assert 60 <= limit.width() < 92, (window.width(), mode.width(), limit.width())
-editor = item('remoteRecordingModeRow_editorColumn')
-assert abs(editor.width() - mode.width() - limit.width() - (limit.x() - mode.x() - mode.width())) < 1
 controller.setRemoteRecordingPreferences(0, 1)
-settle()
+settle_within()
 app.processEvents()
 assert controller.holdVoiceHotkeyText == held_shortcut
-assert not limit.property('visible')
-assert row.property('descriptionText') == '按住说话，松开结束'
-for _ in range(8):
-    app.processEvents()
-    window.grabWindow()
-assert abs(editor.width() - mode.width()) < 1
+assert vm.recordingMode == '按住说话'
 controller.setRemoteRecordingPreferences(1, 1)
-settle()
+settle_within()
 assert controller.holdVoiceHotkeyText == 'lshift+f9'
 controller.setRemoteRecordingPreferences(0, 1)
-settle()
+settle_within()
 from ovb_rc003 import chromecast_client
 from types import SimpleNamespace
 import threading
@@ -1345,6 +1368,7 @@ with mock.patch.object(chromecast_client, 'Client', return_value=listener) as fa
     factory.call_args.kwargs['on_voice']({'event': 'mic', 'data': 'pressed'})
     factory.call_args.kwargs['on_voice']({'event': 'available', 'data': 'ready'})
 assert pressed == ['mic'], pressed
+assert mapping_vm.keyDetectionText == controller.keyDetectionText
 controller._stop_input_resources('key_detection', listener=listener)
 if controller._voice_program_settings['provider'] == 'sogou':
     reads = []
@@ -1359,44 +1383,39 @@ if controller._voice_program_settings['provider'] == 'sogou':
     m.config.set_voice_hotkey_for_provider(controller._config, 'sogou', '', source='default', trigger='toggle')
     controller._config = m.config.save_config_and_load(m.config.config_path(), controller._config)
     controller.setRemoteRecordingPreferences(1, 1)
-    settle()
+    settle_within()
     assert reads == ['toggle'], reads
     assert controller.holdVoiceHotkeyText == 'lshift+f8'
-    assert '开关型' in item('voiceHotkeyRow').property('descriptionText')
+    assert vm.recordingMode == '按一次开·再按一次关'
     controller.setRemoteRecordingPreferences(1, 2)
-    settle()
+    settle_within()
     assert reads == ['toggle']  # Time-only changes do not reread.
     controller.setRemoteRecordingPreferences(0, 1)
-    settle()
+    settle_within()
     assert reads == ['toggle']  # Preserve manual hold.
     controller.refreshVoiceHotkeyFromProvider()
-    settle()
+    settle_within()
     assert reads == ['toggle', 'hold']
     assert controller.holdVoiceHotkeyText == 'lctrl+lshift+f8'
     controller.setRemoteRecordingPreferences(1, 1)
-    settle()
+    settle_within()
     controller._set_voice_hotkey_text(key_mapping.VoiceTriggerMode.HOLD, 'lshift+f9')
     assert controller._persist_voice_settings(hotkey_source='manual')
     reads.clear()
     controller.loadVoiceHotkeyFromProvider()
-    settle()
+    settle_within()
     assert not reads  # Auto hold must not overwrite manual toggle.
     assert controller.holdVoiceHotkeyText == 'lshift+f9'
     controller.refreshVoiceHotkeyFromProvider()
-    settle()
+    settle_within()
     assert reads == ['toggle'] and controller.holdVoiceHotkeyText == 'lshift+f8'
     m.voice_hotkey_sync_windows.read_provider_hotkey = lambda provider, **kw: m.voice_hotkey_sync_windows.VoiceHotkeySyncResult(provider, False, 'read_failed')
     controller.refreshVoiceHotkeyFromProvider()
-    settle()
+    settle_within()
     assert controller.holdVoiceHotkeyText == 'lshift+f8'  # Failed refresh preserves value.
 if os.environ.get('VOICE_ROW_SCREENSHOT'):
     controller.setRemoteRecordingPreferences(1, 1)
-    settle()
-    engine.globalObject().setProperty('voiceScrollProbe', engine.newQObject(item('voiceScroll')))
-    engine.evaluate('voiceScrollProbe.contentItem.contentY = ' + str(max(0, program.y() - 65)))
-    for _ in range(12):
-        app.processEvents()
-        window.grabWindow()
+    settle_within()
     assert window.grabWindow().save(os.environ['VOICE_ROW_SCREENSHOT'])
 controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()

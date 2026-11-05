@@ -1,0 +1,10 @@
+2026-11-06 02:05:12,785 INFO ovb_rc003: recording preferences rejected: mode_index=1 limit_index=1 hotkey_busy=False voice_state=not_tested
+2026-11-06 02:05:12,787 INFO ovb_rc003: recording preferences rejected: mode_index=1 limit_index=2 hotkey_busy=False voice_state=not_tested
+2026-11-06 02:05:12,787 INFO ovb_rc003: recording preferences rejected: mode_index=0 limit_index=2 hotkey_busy=False voice_state=not_tested
+2026-11-06 02:05:12,787 INFO ovb_rc003: recording preferences rejected: mode_index=0 limit_index=1 hotkey_busy=True voice_state=not_tested
+2026-11-06 02:05:33,499 INFO ovb_rc003: recording preferences rejected: mode_index=1 limit_index=1 hotkey_busy=False voice_state=not_tested
+2026-11-06 02:05:56,173 INFO ovb_rc003: recording preferences saved: mode=hold limit=120
+2026-11-06 02:05:56,179 INFO ovb_rc003: recording preferences saved: mode=hold limit=180
+2026-11-06 02:05:56,179 INFO ovb_rc003: recording preferences rejected: mode_index=1 limit_index=1 hotkey_busy=True voice_state=not_tested
+2026-11-06 02:05:56,209 WARNING ovb_rc003: recording preferences save failed: mode=toggle limit=120
+2026-11-06 02:05:56,213 INFO ovb_rc003: recording preferences saved: mode=toggle limit=120

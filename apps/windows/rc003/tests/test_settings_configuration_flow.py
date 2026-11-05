@@ -330,8 +330,11 @@ class ConfigurationQmlFlowTests(unittest.TestCase):
         script = _SETUP + r'''
 from ovb_rc003 import bridge_runtime_status, hid_elevation_windows
 from unittest import mock
-find(window, "bridgeStatusRefreshTimer").setProperty("running", False)
-find(window, "tabBar").setProperty("currentIndex", 2)
+window.setProperty("width", 900)
+window.setProperty("height", 1400)
+_viewmodels.AppViewModel.currentPage = 2
+find(window, "settingsDeviceSection").setProperty("folded", False)
+find(window, "settingsVoiceSection").setProperty("folded", False)
 render(window, app)
 wait_for_voice_hotkey_idle(controller, app)
 controller._bridge_running = True
@@ -344,22 +347,46 @@ bridge_runtime_status.publish_status(m.config.config_root(), bridge_runtime_stat
     pid=os.getpid(), raw_input_state="ready", hid_tap_state="ready", voice_key_physicalizer_state="ready")
 controller._set_bridge_input_states(bridge_runtime_status.read_status(m.config.config_root()))
 controller._set_bridge_restart_recommended(False)
-page = find(window, "deviceScroll").parent()
-assert not page.bridgeActionVisible()
+assert not controller.bridgeRestartRecommended
 controller._request_endpoint_preflight = lambda name, api, done: (done(True, ""), True)[1]
 controller._request_endpoint_options_refresh = lambda: None
 assert controller.selectAndPersistOutputEndpoint("CABLE Input", "Windows WASAPI")
-assert page.bridgeActionVisible()
-assert page.bridgeActionText() == "重启服务"
-diagnostics._is_refreshing = False
-diagnostics.isRefreshingChanged.emit()
-assert find(window, "testVbCableChannelButton") is not None
-find(window, "tabBar").setProperty("currentIndex", 0)
+# The saved output change requires a service restart and the restart action
+# stays exposed on the device surface.
+assert controller.bridgeRestartRecommended
+device_vm = _viewmodels.DeviceViewModel
+action_label = str(device_vm.connectionCard.actionLabel)
+assert action_label == "连接 / 重连"
+button = find(window, "settingsBridgeActionButton")
+assert button is not None
+assert button.property("visible") and button.property("enabled")
+assert str(button.property("text")) == action_label
+assert find(window, "settingsTestAudioButton") is not None
+point = button.mapToScene(
+    QPointF(button.property("width") / 2, button.property("height") / 2)
+).toPoint()
 with mock.patch.object(controller, "restartBridge") as restart:
-    find(window, "bridgeActionButton").clicked.emit()
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
+    render(window, app)
     restart.assert_called_once_with()
-assert '点击“应用”' not in (m._qml_directory() / "VoicePage.qml").read_text(encoding="utf-8")
-assert '点击“选推荐端点”' in (m._qml_directory() / "VoicePage.qml").read_text(encoding="utf-8")
+# The VB-CABLE install flow steers users to the recommended endpoint and
+# never to a generic apply action.
+qml_dir = m._qml_directory()
+onboarding = (qml_dir / "OnboardingPage.qml").read_text(encoding="utf-8")
+assert "VB-CABLE" in onboarding
+assert "在设置中把语音输出端点选为 CABLE Input" in onboarding
+for qml_file in sorted(qml_dir.glob("*.qml")):
+    assert '点击“应用”' not in qml_file.read_text(encoding="utf-8"), qml_file.name
+# The recommended endpoint is marked as such on the presentation surface.
+controller._endpoint_options = ["CABLE Output", "CABLE Input"]
+controller._recommended_endpoint_index = 1
+controller._selected_endpoint_index = 0
+controller.endpointOptionsChanged.emit()
+controller.recommendedEndpointIndexChanged.emit()
+controller.selectedEndpointIndexChanged.emit()
+endpoints = [row.contract for row in _viewmodels.VoiceViewModel.outputEndpoints]
+assert [row.detail for row in endpoints] == ["", "推荐"]
+assert [row.selected for row in endpoints] == [True, False]
 print(json.dumps({"warnings": [str(item) for item in warnings]}))
 window.hide()
 m._shutdown_diagnostics_workers()

@@ -227,6 +227,15 @@ if VB_CABLE_BUNDLE_ZIP.is_file():
 datas.append((str(FRIDA_GADGET_ARCHIVE), "ovb_rc003/frida_assets"))
 
 hiddenimports = [
+    # The UI-facing presentation layer. It is imported from inside a function
+    # in qt_settings_app.py, so list it explicitly rather than rely on the
+    # bytecode scanner finding it.
+    "ovb_rc003.presentation",
+    "ovb_rc003.presentation.contracts",
+    "ovb_rc003.presentation.transport",
+    "ovb_rc003.presentation.viewmodels",
+    "ovb_rc003.presentation.registry",
+    "ovb_rc003.presentation.onboarding",
     # Imports made inside the two Cython extension modules are opaque to
     # PyInstaller's Python bytecode scanner. Keep their stdlib closure
     # explicit so both the main program and the narrow helper can initialize

@@ -16,7 +16,7 @@ VCVR  =  Vibe Coding Voice Remote
 
 | 项目 | 值 |
 |---|---|
-| 程序 | `E:\CZ\RJ\VCVR\VCVR 1.0.104.exe` |
+| 程序 | `VCVR 1.0.104.exe`（安装目录） |
 | 遥控器 | `Chromecast Remote` · VID `18D1` / PID `9450` / REV `0110` |
 | 豆包 | `v1.0.0.23`（已适配） |
 | 虚拟声卡 | VB-CABLE（`CABLE Input` 播放 / `CABLE Output` 录音） |
@@ -70,7 +70,7 @@ VCVR 通过 Frida 注入豆包进程，钩住它 `ImeService.exe` 里的键盘�
 
 ### 豆包升级了怎么办（两步，不需要重新编译）
 
-1. 双击 `E:\CZ\RJ\remote-mic-fork\适配新豆包版本.bat`
+1. 双击仓库根目录的 `适配新豆包版本.bat`
 2. 重启 VCVR
 
 脚本会从当前豆包目录算出 **3 个文件哈希 + 3 个 RVA + 2 段签名字节**，
@@ -136,8 +136,8 @@ VCVR 通过 Frida 注入豆包进程，钩住它 `ImeService.exe` 里的键盘�
 ## 五、构建
 
 ```bat
-cd E:\CZ\RJ\remote-mic-fork\apps\windows\rc003
-E:\CZ\RJ\build-venv\Scripts\python.exe -m PyInstaller ^
+cd apps\windows\rc003
+python -m PyInstaller ^
     build\RemoteMicRC003.spec --distpath dist --workpath build\pyinstaller-work --noconfirm
 ```
 
@@ -164,11 +164,11 @@ E:\CZ\RJ\build-venv\Scripts\python.exe -m PyInstaller ^
 ## 七、目录
 
 ```
-E:\CZ\RJ\
+<工作区>\
 ├─ VCVR\                          ← 运行目录（以管理员启动里面的 exe）
-├─ remote-mic-fork\               ← 源码（GitHub 上游 + 本分支改动）
+└─ remote-mic-fork\               ← 本仓库（源码）
 │   ├─ apps\windows\rc003\src\ovb_rc003\   核心模块
-│   ├─ tools\doubao_profile.py             新豆包版本参数扫描器
+│      ├─ tools\doubao_profile.py             新豆包版本参数扫描器
 │   ├─ tools\adapt_doubao.py               一键生成适配 JSON / 改源码
 │   ├─ docs\豆包版本适配说明.md             版本适配详细说明
 │   └─ 适配新豆包版本.bat                   豆包升级后双击它

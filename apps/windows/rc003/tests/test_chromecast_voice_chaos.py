@@ -43,7 +43,6 @@ from ovb_rc003.chromecast_voice_receiver import VoiceReceiver
 from tests.test_chromecast_host_activity import session
 import tests.test_chromecast_voice as voice_tests
 
-PHYSICAL = bytes((4, 3, 2, 1))
 SOFTWARE = bytes((4, 0, 2, 0))
 RELEASE = bytes((0, 2))
 STOP = bytes((0, 0))
@@ -415,10 +414,16 @@ class ChaosWorld:
         gate = copy.deepcopy(self.receiver.gate)
         now, plan = self.clock(), self.open_plan
         open_failure_sent = self.open_failure_sent
+        pending = self.receiver.pending
         for _ in range(80):
             if gate.state == "idle" and gate.stream is None and not gate.possible_open:
                 return False
             effects = []
+            if pending is not None:
+                # A write already in flight completes too; a confirmed close
+                # releases the open liability just like any later close.
+                effects.append(pending[0])
+                pending = None
             if gate.state == "starting":
                 effects += gate.host_result(gate.attempt, True, now)
             effects += gate.host_stopped(gate.attempt, True, now)
