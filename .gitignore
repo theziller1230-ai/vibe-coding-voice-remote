@@ -13,3 +13,6 @@ docs/*
 !docs/screenshots/settings-connection.png
 !docs/screenshots/settings-buttons.png
 AGENTS.md
+
+# 测试临时目录（probe 会把日志写到这里）
+%TEMP%rmic-probe-exp/
