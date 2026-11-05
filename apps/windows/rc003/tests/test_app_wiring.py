@@ -987,17 +987,17 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
         original = config.default_key_bindings()
         self._save_button_bindings(original)
 
-        with mock.patch.object(win32_input, "send_arrow_up") as old_action, mock.patch.object(
+        with mock.patch.object(win32_input, "send_mouse_wheel") as old_action, mock.patch.object(
             win32_input, "send_key_combo_tap"
         ) as new_action:
             self.app._on_button_event("up", True, event_source="hid")
             changed = config.load_key_bindings(self.app._bindings_path)
-            changed["bindings"]["up"] = {"kind": "mouse_wheel_up", "keys": []}
+            changed["bindings"]["up"] = {"kind": "key_combo", "keys": ["pageup"]}
             self._save_button_bindings(changed)
             timers[0].fire()
             self.app._on_button_event("up", False, event_source="hid")
 
-        self.assertEqual(old_action.call_count, 2)
+        self.assertEqual(old_action.call_args_list, [mock.call(120), mock.call(120)])
         new_action.assert_not_called()
         self.assertIsNone(self.app._pending_bindings)
 
@@ -3335,23 +3335,32 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
     def test_direction_hold_repeats_faster_and_release_stops_both_sources(self):
         timers = self._use_recorded_repeat_timers()
+        # The shipped default layout scrolls on the D-pad's up/down (one wheel
+        # notch per tap, smooth-scroll repeat) and keeps plain arrows on
+        # left/right (the faster D-pad repeat); both beat the ordinary rate.
+        cases = (
+            ("up", "send_mouse_wheel", (120,), 0.060),
+            ("down", "send_mouse_wheel", (-120,), 0.060),
+            ("left", "send_arrow_left", (), 0.065),
+            ("right", "send_arrow_right", (), 0.065),
+        )
         for source in ("hid_tap", "chromecast"):
-            for button in ("up", "down", "left", "right"):
+            for button, sender_name, sender_args, interval in cases:
                 with self.subTest(source=source, button=button), mock.patch.object(
-                    win32_input, "send_arrow_" + button
+                    win32_input, sender_name
                 ) as send, mock.patch.object(
                     app_module.element_navigation_control_windows,
                     "route_mapped_navigation_key", return_value=False,
                 ):
                     self.app._on_button_event(button, True, event_source=source)
-                    send.assert_called_once_with()
+                    send.assert_called_once_with(*sender_args)
                     self.assertEqual(timers[-1].delay, 0.350)
                     # Repeated device DOWN reports must not add extra steps.
                     self.app._on_button_event(button, True, event_source=source)
-                    send.assert_called_once_with()
+                    send.assert_called_once_with(*sender_args)
                     for _ in range(3):
                         timers[-1].fire()
-                        self.assertEqual(timers[-1].delay, 0.065)
+                        self.assertEqual(timers[-1].delay, interval)
                     self.assertEqual(send.call_count, 4)
                     stale_timer = timers[-1]
                     self.app._on_button_event(button, False, event_source=source)
@@ -3388,6 +3397,12 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
     def test_faster_direction_repeat_routes_navigation_without_duplicate_input(self):
         timers = self._use_recorded_repeat_timers()
+        # The shipped default scrolls on "up"; the faster navigation-routing
+        # repeat is what an arrow-mapped direction button gets, so bind one
+        # explicitly.
+        self.app._bindings["bindings"]["up"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ARROW_UP
+        ).to_dict()
         with mock.patch.object(
             app_module.element_navigation_control_windows,
             "route_mapped_navigation_key", return_value=True,
@@ -3721,19 +3736,6 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
 
         self.assertEqual(button_calls, ["left", "right", "middle", "x1", "x2"])
 
-    def test_old_wheel_mapping_becomes_nonrepeating_page_key(self):
-        for button_id in ("mic", "power", "up", "down", "left", "right", "ok", "back",
-                          "volume_up", "volume_down", "home", "menu", "tv"):
-            for kind in (key_mapping.ActionKind.MOUSE_WHEEL_UP,
-                         key_mapping.ActionKind.MOUSE_WHEEL_DOWN):
-                with self.subTest(button_id=button_id, kind=kind):
-                    self.app._bindings["bindings"][button_id] = {"kind": kind.value, "keys": []}
-                    self.assertFalse(self.app._is_button_repeatable(button_id))
-                    action = key_mapping.button_action_for(
-                        self.app._bindings, button_id, key_mapping.ButtonTrigger.SINGLE_CLICK
-                    )
-                    self.assertEqual(action.kind, key_mapping.ActionKind.KEY_COMBO)
-
     def test_every_visible_action_option_saves_and_has_an_execution_route(self):
         senders = (
             "send_key_combo_tap", "send_escape", "send_return", "send_arrow_up",
@@ -3913,8 +3915,8 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
         calls = []
         with mock.patch.object(
             win32_input,
-            "send_arrow_up",
-            side_effect=lambda: calls.append("up"),
+            "send_mouse_wheel",
+            side_effect=lambda _delta: calls.append("up"),
         ):
             self.app._on_button_event("up", True, event_source="hid")
             self.app._on_button_event("up", True, event_source="hid_tap")
@@ -3933,10 +3935,10 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
                         "mic", self.app._primary_button_action("mic")))
                     self.assertFalse(self.app._handle_mic_button_pressed())
                     output.assert_not_called()
-                with mock.patch.object(win32_input, "send_arrow_up") as up:
+                with mock.patch.object(win32_input, "send_mouse_wheel") as up:
                     self.app._on_button_event("up", True, event_source="hid_tap")
                     self.app._on_button_event("up", False, event_source="hid_tap")
-                    up.assert_called_once()
+                    up.assert_called_once_with(120)
                 self.assertEqual(self.app._ble_session.mic_open_calls, 0)
 
     def test_chatterfly_without_its_own_key_uses_control_without_keyboard_fallback(self):
@@ -3970,8 +3972,8 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             "record_rc003_direction_edge",
         ) as navigation_fallback, mock.patch.object(
             win32_input,
-            "send_arrow_up",
-            side_effect=lambda: order.append(("mapping",)),
+            "send_mouse_wheel",
+            side_effect=lambda _delta: order.append(("mapping",)),
         ):
             self.app._on_direct_hid_report(
                 1,
@@ -4042,8 +4044,8 @@ class OrdinaryButtonGestureWiringTests(_AppWiringTestCase):
             side_effect=lambda *args: order.append(("fallback", args)) or True,
         ), mock.patch.object(
             win32_input,
-            "send_arrow_up",
-            side_effect=lambda: order.append(("mapping",)),
+            "send_mouse_wheel",
+            side_effect=lambda _delta: order.append(("mapping",)),
         ):
             self.app._on_direct_hid_report(
                 1,
@@ -7205,8 +7207,8 @@ class InputLifecycleTests(_AppWiringTestCase):
 
         with mock.patch.object(
             win32_input,
-            "send_arrow_up",
-            side_effect=lambda: calls.append("up"),
+            "send_mouse_wheel",
+            side_effect=lambda _delta: calls.append("up"),
         ):
             self.app._on_button_event("up", True, event_source="hid_tap")
             self.app._on_button_event("up", False, event_source="hid_tap")

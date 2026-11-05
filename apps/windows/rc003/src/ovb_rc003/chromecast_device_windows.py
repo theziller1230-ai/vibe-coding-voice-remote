@@ -442,6 +442,10 @@ class SelectedDevice:
         keys = [f"ab5e000{part}-5a21-4f05-bc7d-af01f617b664" for part in (2, 3, 4)]
         if (int(result.status) != 0 or len(characteristics) != len(discovered)
                 or not all(key in characteristics for key in keys)):
+            # This branch never set the retry flag at all, so it kept the
+            # "False" written at the top of open_voice() and even a plain
+            # DeviceUnreachable here stayed dead until the app was restarted.
+            self.voice_retryable = int(result.status) == 1  # DeviceUnreachable only.
             raise PipeError("unsupported_layout")
         tx, audio, control = (characteristics[key] for key in keys)
         self.voice_evidence.update(tx=int(tx.characteristic_properties),

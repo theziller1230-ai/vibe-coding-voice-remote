@@ -196,6 +196,89 @@ class DoubaoHostTests(unittest.TestCase):
         finish.assert_not_called()
         self.host.client.voice_host.assert_any_call(1, "stop")
 
+    def test_teardown_before_confirm_still_finishes_a_live_capture(self):
+        # The toggle key goes out before the attempt confirms, so a teardown
+        # during "starting" can leave Doubao capturing. Leaving it running makes
+        # the NEXT press switch the engine off instead of starting a dictation -
+        # no voice bar at all - which is exactly the reported symptom.
+        self.owner._config["remote_recording_mode"] = "toggle"
+        self.owner._config["voice_hotkeys_by_provider"]["doubao_ime"].update(
+            toggle="lshift+f9", toggle_source="auto")
+        active = session("doubao", pid=41)
+        self.capture.return_value = ()
+        self.host._start_host(1)
+        self.assertEqual(self.host.state, "starting")
+        self.capture.return_value = (active,)
+        with (
+            mock.patch.object(handsfree, "finish_with_timeout") as finish,
+            mock.patch.object(host_module.win32_input,
+                              "send_voice_key_combo_tap") as tap,
+        ):
+            self.host._stop_host("")
+        # The watch never bound, so the private RPC has no capture to stop and
+        # the physicalized toggle key is what actually switches Doubao off.
+        finish.assert_called_once()
+        tap.assert_called_once()
+
+    def test_no_finish_once_the_capture_is_already_gone(self):
+        # ...but never tap the toggle key for a capture that has ended: that
+        # would START a dictation the user never asked for.
+        self.owner._config["remote_recording_mode"] = "toggle"
+        self.owner._config["voice_hotkeys_by_provider"]["doubao_ime"].update(
+            toggle="lshift+f9", toggle_source="auto")
+        self.capture.return_value = ()
+        self.host._start_host(1)
+        self.host._poll_host()
+        with (
+            mock.patch.object(host_module.time, "monotonic", return_value=10) as clock,
+            mock.patch.object(handsfree, "finish_with_timeout") as finish,
+            mock.patch.object(host_module.win32_input,
+                              "send_voice_key_combo_tap") as tap,
+        ):
+            self.host._poll_host()
+            clock.return_value = 12
+            self.host._poll_host()
+            self.host._stop_host("")
+        finish.assert_not_called()
+        tap.assert_not_called()
+
+    def test_lost_start_key_is_resent_once_while_doubao_stays_idle(self):
+        # Doubao is a toggle driven by one key press. If that press lands while
+        # the engine is still settling from the previous stop it is lost, and
+        # the attempt waits for a capture that never comes. Re-send it once -
+        # and only while Doubao verifiably is not capturing.
+        self.owner._config["remote_recording_mode"] = "toggle"
+        self.owner._config["voice_hotkeys_by_provider"]["doubao_ime"].update(
+            toggle="lshift+f9", toggle_source="auto")
+        self.capture.return_value = ()
+        with mock.patch.object(host_module.time, "monotonic", return_value=10) as clock:
+            self.host._start_host(1)
+            with mock.patch.object(host_module.win32_input,
+                                   "send_voice_key_combo_tap") as tap:
+                self.host._poll_host()
+                tap.assert_not_called()          # too early to retry
+                clock.return_value = 11.6
+                self.host._poll_host()
+                tap.assert_called_once()
+                clock.return_value = 13
+                self.host._poll_host()
+                tap.assert_called_once()         # exactly one retry
+
+    def test_no_start_retry_while_doubao_is_already_capturing(self):
+        self.owner._config["remote_recording_mode"] = "toggle"
+        self.owner._config["voice_hotkeys_by_provider"]["doubao_ime"].update(
+            toggle="lshift+f9", toggle_source="auto")
+        active = session("doubao", pid=41)
+        self.capture.return_value = ()
+        with mock.patch.object(host_module.time, "monotonic", return_value=10) as clock:
+            self.host._start_host(1)
+            self.capture.return_value = (active,)
+            with mock.patch.object(host_module.win32_input,
+                                   "send_voice_key_combo_tap") as tap:
+                clock.return_value = 12
+                self.host._poll_host()
+        tap.assert_not_called()
+
     def test_handsfree_time_limit_finishes_the_bound_capture_once(self):
         self.owner._config["remote_recording_mode"] = "toggle"
         self.owner._config["voice_hotkeys_by_provider"]["doubao_ime"].update(

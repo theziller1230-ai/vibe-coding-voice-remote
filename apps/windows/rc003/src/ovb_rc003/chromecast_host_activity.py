@@ -118,16 +118,25 @@ class CaptureWatch:
 
     Grace tolerates engine state transitions, not pauses in speech. Silence
     leaves a running capture Active. Replacement sessions are not auto-adopted.
+    ``adopt_existing`` only widens the binding: a session that was already
+    active at ``begin()`` is adopted once the fallback window proves no new
+    session is coming - never before.
     """
     POLL_SECONDS = .25
     STARTUP_POLL_SECONDS = STARTUP_POLL_SECONDS
     STARTUP_FAST_WINDOW_SECONDS = STARTUP_FAST_WINDOW_SECONDS
     END_GRACE_SECONDS = .75
+    # An adopted session can be the previous attempt's leftover, visible but
+    # already dying. Follow a fresh session instead of ending an attempt the
+    # user is still dictating into, as long as the swap happens this quickly.
+    REBIND_GRACE_SECONDS = .7
 
-    def __init__(self, reader=None, *, fast_start=False):
+    def __init__(self, reader=None, *, fast_start=False, adopt_existing=False):
         self.reader = reader or read_wetype_capture
         self._fast_start = fast_start
+        self._adopt_existing = adopt_existing
         self._fast_start_until = None
+        self._bound_at = None
         self._fast_polls = 0
         self.baseline = None
         self.identity = None
@@ -138,9 +147,17 @@ class CaptureWatch:
 
     def begin(self):
         try:
-            self.baseline = {s.identity for s in self.reader() if s.state == 1}
+            active = {s.identity for s in self.reader() if s.state == 1}
         except Exception:
             self.status = "unavailable"
+            return
+        # Always take the session that is active right away. The keyboard-started
+        # dictation is usually ALREADY capturing when the attempt arrives - the
+        # physical key reached the engine first - and making it wait for a
+        # "fallback" window costs the user a full second of dead air before the
+        # microphone opens. A session left over from the previous attempt is
+        # harmless here: it is already dying, and poll() rebinds to the fresh one.
+        self.baseline = set() if self._adopt_existing else active
 
     def poll(self, now):
         if self.ended or self.baseline is None or now < self.next_poll:
@@ -167,11 +184,24 @@ class CaptureWatch:
                 self.status = "waiting" if not candidates else "ambiguous"
                 return False
             self.identity = next(iter(candidates))
+            self._bound_at = now
             self.next_poll = now + self.POLL_SECONDS
         if self.identity in active:
             self.inactive_since = None
             self.status = "tracking"
         else:
+            if (self._adopt_existing and self._bound_at is not None
+                    and now - self._bound_at < self.REBIND_GRACE_SECONDS
+                    and len(active) == 1):
+                # The adopted session may have been the previous attempt's
+                # leftover, visible but already dying. When it disappears and a
+                # single fresh session is there, follow that one instead of
+                # ending an attempt the user is still dictating into.
+                self.identity = next(iter(active))
+                self._bound_at = now
+                self.inactive_since = None
+                self.status = "tracking"
+                return self.ended
             if self.inactive_since is None:
                 self.inactive_since = now
             self.ended = now - self.inactive_since >= self.END_GRACE_SECONDS

@@ -54,14 +54,14 @@ class StartupWindowsTests(unittest.TestCase):
             startup_windows.build_startup_command(
                 frozen=True,
                 executable=(
-                    r"C:\无线麦 测试\无线麦 win版 "
+                    r"C:\无线麦 测试\VCVR "
                     r"1.0.51-candidate.51.exe"
                 ),
             )
         )
         self.assertEqual(
             command,
-            '"C:\\无线麦 测试\\无线麦 win版 1.0.51-candidate.51.exe" --background',
+            '"C:\\无线麦 测试\\VCVR 1.0.51-candidate.51.exe" --background',
         )
 
     def test_frozen_command_uses_background_shell(self):
@@ -157,7 +157,7 @@ class StartupWindowsTests(unittest.TestCase):
     def test_rebind_owned_frozen_startup_migrates_legacy_to_versioned_name(self):
         old_executable = r"D:\旧版\RemoteMicRC003.exe"
         new_executable = (
-            r"E:\新版 无线麦\无线麦 win版 1.0.51-candidate.51.exe"
+            r"E:\新版 无线麦\VCVR 1.0.51-candidate.51.exe"
         )
         old_command = startup_windows.command_line(
             [old_executable, "--background"]
@@ -179,26 +179,42 @@ class StartupWindowsTests(unittest.TestCase):
         )
 
     def test_rebind_owned_frozen_startup_migrates_between_versioned_names(self):
-        old_executable = r"D:\旧版\无线麦 win版 1.0.50-candidate.50.exe"
-        new_executable = r"E:\新版\无线麦 win版 1.0.51-candidate.51.exe"
-        old_command = startup_windows.command_line(
-            [old_executable, "--background"]
+        cases = (
+            # First launch after the VCVR rename: the autostart entry still
+            # points at the pre-rename executable of an existing install.
+            (
+                r"D:\旧版\无线麦 win版 1.0.50-candidate.50.exe",
+                r"E:\新版\VCVR 1.0.51-candidate.51.exe",
+            ),
+            # Steady-state upgrades rebind between current versioned names.
+            (
+                r"D:\旧版\VCVR 1.0.50-candidate.50.exe",
+                r"E:\新版\VCVR 1.0.51-candidate.51.exe",
+            ),
         )
-        registry = _FakeWinreg(old_command)
+        for old_executable, new_executable in cases:
+            with self.subTest(old=old_executable, new=new_executable):
+                old_command = startup_windows.command_line(
+                    [old_executable, "--background"]
+                )
+                registry = _FakeWinreg(old_command)
 
-        state = startup_windows.rebind_owned_frozen_startup(
-            platform="win32",
-            frozen=True,
-            executable=new_executable,
-            winreg_module=registry,
-            command_parser=lambda _value: [old_executable, "--background"],
-        )
+                state = startup_windows.rebind_owned_frozen_startup(
+                    platform="win32",
+                    frozen=True,
+                    executable=new_executable,
+                    winreg_module=registry,
+                    command_parser=lambda _value, old_executable=old_executable: [
+                        old_executable,
+                        "--background",
+                    ],
+                )
 
-        self.assertTrue(state.enabled)
-        self.assertEqual(
-            registry.value,
-            startup_windows.command_line([new_executable, "--background"]),
-        )
+                self.assertTrue(state.enabled)
+                self.assertEqual(
+                    registry.value,
+                    startup_windows.command_line([new_executable, "--background"]),
+                )
 
     def test_rebind_owned_frozen_startup_rejects_unrecognized_current_name(self):
         registry = _FakeWinreg(
@@ -209,7 +225,7 @@ class StartupWindowsTests(unittest.TestCase):
         state = startup_windows.rebind_owned_frozen_startup(
             platform="win32",
             frozen=True,
-            executable=r"E:\新版\无线麦.exe",
+            executable=r"E:\新版\VCVR.exe",
             winreg_module=registry,
             command_parser=lambda _value: self.fail("parser should not run"),
         )

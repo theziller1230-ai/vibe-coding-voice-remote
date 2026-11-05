@@ -29,6 +29,17 @@ def _selected(entity):
     return remote_selection.active_key(settings) == entity and remote_selection.active_profile(settings) == remote_selection.CHROMECAST_PROFILE
 
 
+_VOICE_OPEN_RETRIES = 2
+_VOICE_OPEN_RETRY_DELAY_SECONDS = 0.6
+
+
+async def _retry_voice_open(voice) -> None:
+    """Give the ATVV characteristic discovery one more chance."""
+
+    await asyncio.sleep(_VOICE_OPEN_RETRY_DELAY_SECONDS)
+    await voice.open()
+
+
 async def _probe_source(device, marker, observation):
     started = time.monotonic()
     observation.source_probe("begin", started)
@@ -54,6 +65,7 @@ async def receive(identity, parent, pipe):
     device, capture, receiver, probe = None, None, None, None
     hid_tap, hid_start, hid_deadline, hid_armed = None, None, None, False
     voice, voice_open = None, None
+    voice_retries = 0
     voice_enabled = False
     input_epoch = 0
     reason, cleanup_ok, announced = "stopped", True, False
@@ -240,8 +252,18 @@ async def receive(identity, parent, pipe):
             if voice and voice_open.done():
                 stage = "voice_open"
                 await voice_open
-                stage = "voice_tick"
-                await voice.tick()
+                if not voice.available and voice_retries < _VOICE_OPEN_RETRIES:
+                    # Enumerating the ATVV characteristics can fail transiently
+                    # right after the GATT session comes up (WinRT returns a
+                    # failed status instead of racing). Without a retry the
+                    # whole voice path stays "unavailable" until the app is
+                    # restarted, which reads as "the voice button does nothing".
+                    voice_retries += 1
+                    observation.stage("voice_open_retry")
+                    voice_open = asyncio.create_task(_retry_voice_open(voice))
+                else:
+                    stage = "voice_tick"
+                    await voice.tick()
             observation.flush()
             await asyncio.sleep(.05)
     except Exception as error:

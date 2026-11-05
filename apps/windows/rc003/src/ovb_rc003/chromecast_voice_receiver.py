@@ -295,7 +295,11 @@ class VoiceReceiver:
         if not self.available or self.detect_only:
             return
         attempt, result, now = message["attempt"], message["result"], time.monotonic()
-        if result in ("ready", "failed"):
+        if result == "begin":
+            # The keyboard hotkey starts Doubao without the remote reporting a
+            # stream, so the attempt itself has to be opened host-side.
+            self.effects(self.gate.begin_host_start(now))
+        elif result in ("ready", "failed"):
             self.effects(self.gate.host_result(attempt, result == "ready", now))
         elif result in ("released", "release_failed"):
             self.effects(self.gate.host_stopped(attempt, result == "released", now))

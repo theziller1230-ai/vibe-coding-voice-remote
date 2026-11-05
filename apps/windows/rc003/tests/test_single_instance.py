@@ -339,7 +339,7 @@ class BridgeInstanceGuardDuplicateTests(unittest.TestCase):
                 ):
                     self.fail("the duplicate guard's body must never run")
         self.assertEqual(len(duplicate_close_calls), 1)
-        self.assertIn("无线麦", str(ctx.exception))
+        self.assertIn("VCVR", str(ctx.exception))
         self.assertIn("CloseHandle returned FALSE", str(ctx.exception))
 
     def test_duplicate_error_message_never_contains_the_raw_handle_value(self):
@@ -538,7 +538,7 @@ class ApplicationRuntimeInstanceGuardTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(len(calls), 1)
         title, message = calls[0]
-        self.assertEqual(title, "无线麦 0.2.0-candidate.7")
+        self.assertEqual(title, "VCVR 0.2.0-candidate.7")
         self.assertEqual(
             message,
             "旧版正在运行。\n\n"
@@ -739,7 +739,7 @@ class ShowBridgeStartupBlockedNoticeTests(unittest.TestCase):
         )
         self.assertEqual(len(calls), 1)
         title, message = calls[0]
-        self.assertEqual(title, "无线麦")
+        self.assertEqual(title, "VCVR")
         self.assertEqual(message, "custom duplicate message")
 
     def test_falls_back_to_stderr_when_the_message_box_itself_fails(self):

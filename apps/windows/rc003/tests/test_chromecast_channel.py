@@ -178,6 +178,19 @@ class ChannelTests(unittest.TestCase):
     def test_session_token_not_in_debug_representation(self):
         self.assertNotIn(self.identity.token, repr(self.identity))
 
+    def test_voice_host_begin_starts_an_attempt_without_a_number(self):
+        sender, receiver = (Channel(self.identity, commands=True) for _ in range(2))
+        receiver.decode(sender.encode("start", mode="run", voice=True))
+        self.assertEqual(
+            receiver.decode(sender.encode("voice_host", attempt=0, result="begin"))["result"],
+            "begin",
+        )
+        for fields in ({"attempt": 0, "result": "ready"},
+                       {"attempt": 1, "result": "beginning"},
+                       {"attempt": -1, "result": "begin"}):
+            with self.assertRaises(ChannelError):
+                sender.encode("voice_host", **fields)
+
     def test_ready_and_edge_order_fail_closed(self):
         for kind, fields in (("ready", {}), ("edge", {"button": "up", "action": "up", "time": 1})):
             channel = Channel(self.identity, commands=False)

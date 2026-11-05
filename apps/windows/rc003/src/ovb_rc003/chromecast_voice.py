@@ -168,6 +168,18 @@ class Recording:
         self.closed_streams.clear()
         return [self._effect("host_start"), self._effect("state", "starting")]
 
+    def begin_host_start(self, now):
+        """Begin an attempt that the keyboard hotkey started.
+
+        The remote reports no AUDIO_START for these, so the attempt and the
+        stream-open request that follows host confirmation have to originate
+        here instead of in ``control``.
+        """
+        self._clock(now)
+        if self.state != "idle" or self.stream is not None or self.possible_open:
+            return []
+        return self._begin(now)
+
     def _activate(self, now):
         if (self.state == "starting" and self.host_ready and self.stream is not None
                 and (self.mode == "hold" or self.stream == (0, 0))):
@@ -179,6 +191,11 @@ class Recording:
         stream = self.stream[0] if self.stream is not None else 0 if self.possible_open else None
         if stream is None or stream in self.closed_streams:
             return []
+        self.closed_streams.add(stream)
+        return [self._effect("device", bytes((0x0d, stream)))]
+
+    def _close_segment(self, stream):
+        # Each proven segment incarnation is owed its own exact close command.
         self.closed_streams.add(stream)
         return [self._effect("device", bytes((0x0d, stream)))]
 
@@ -249,6 +266,23 @@ class Recording:
                        and not self.shutting_down and not self.possible_open
                        and stream[1] == 3 and now - self.phase_at < STOP_TIMEOUT
                        and (self.stream is None or self._hold_start is not None))
+            if not handoff and (self.state in ("stopping", "blocked") or self.shutting_down):
+                # A press that cannot be served must not corrupt the gate: the
+                # stream attribution and the quiet proof are never rewritten
+                # here, so the cleanup in flight can still settle back to idle.
+                if stream[1] == 3:
+                    # Close only the unsolicited segment itself; the remote
+                    # ends its hold on release, and the old cleanup's own
+                    # STOP/close proofs keep their meaning.
+                    self.closed_streams.discard(stream[0])
+                    return (self.finish(now, "stopped", shutdown=self.shutting_down)
+                            + self._close_segment(stream[0]))
+                # A late software stream is an open that landed anyway: adopt
+                # and close it exactly once, keeping its STOP attribution so
+                # the open liability is discharged by the device's own stop.
+                self.stream = stream
+                self.closed_streams.discard(stream[0])
+                return self.finish(now, "stopped", shutdown=self.shutting_down)
             self.stream = stream
             if stream[1] == 3:
                 # A new proven HTT stream replaces the old software stream.
@@ -260,8 +294,6 @@ class Recording:
                 self._hold_start = payload
                 return self.tick(now)
             self.stop_seen = None
-            if self.state in ("stopping", "blocked") or self.shutting_down:
-                return self.finish(now, "stopped", shutdown=self.shutting_down)
             if self.state == "idle":
                 if stream[1] != 3:
                     return self.finish(now, "unsolicited_open")
@@ -356,7 +388,8 @@ class Recording:
                     and self.stream is not None and self.stream[0] == command[1])
         return (command[0] == 0x0d and self.state in ("stopping", "blocked")
                 and ((self.stream is not None and command[1] == self.stream[0])
-                     or (command[1] == 0 and self.possible_open)))
+                     or (command[1] == 0 and self.possible_open)
+                     or command[1] in self.closed_streams))
 
     def command_submitted(self, effect):
         if not self.command_valid(effect):
@@ -367,7 +400,19 @@ class Recording:
 
     def command_result(self, effect, success, now):
         self._clock(now)
-        if effect.attempt != self.attempt or success is True:
+        if effect.attempt != self.attempt:
+            return []
+        if success is True:
+            if effect.value[:1] == b"\x0d":
+                # A completed close is the device's proof that the segment is
+                # gone. Without it a software open or a force-closed segment
+                # would hold the gate hostage and block every keyboard begin.
+                if self.stream is not None and self.stream[0] == effect.value[1]:
+                    self.stream = None
+                if effect.value[1] == 0:
+                    self.possible_open = False
+                if self.stream is None and not self.possible_open:
+                    self.stop_seen = now
             return []
         if effect.value[0] == 0x0d:
             self._clear_hold_start()

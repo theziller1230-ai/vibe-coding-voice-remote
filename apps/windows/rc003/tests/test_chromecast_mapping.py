@@ -15,8 +15,15 @@ class ChromecastLayoutTests(unittest.TestCase):
         self.assertNotIn("menu", order)
         self.assertNotIn("tv", order)
         defaults = remote_layout.default_actions(profile)
-        for key in ("youtube", "netflix", "input_source"):
-            self.assertEqual(defaults[key].kind, key_mapping.ActionKind.DISABLED)
+        self.assertEqual(
+            defaults["youtube"],
+            key_mapping.ButtonAction(key_mapping.ActionKind.KEY_COMBO, ("lctrl", "c")),
+        )
+        self.assertEqual(
+            defaults["netflix"],
+            key_mapping.ButtonAction(key_mapping.ActionKind.KEY_COMBO, ("lctrl", "v")),
+        )
+        self.assertEqual(defaults["input_source"].kind, key_mapping.ActionKind.DISABLED)
         self.assertEqual(defaults["volume_mute"].kind, key_mapping.ActionKind.SYSTEM_VOLUME_MUTE)
         for button in order:
             hotspot = remote_layout.hotspot_for(button, profile)
@@ -91,4 +98,4 @@ class ChromecastMappingControllerTests(unittest.TestCase):
             self.assertIn("Chromecast-remote-photo.png", controller.photoSource)
             controller.restoreMappingDefaults()
             self.assertTrue(controller._save_mapping(), controller.errorMessage)
-            self.assertEqual(model.to_display_map()["youtube"], "禁用")
+            self.assertEqual(model.to_display_map()["youtube"], "lctrl+c")

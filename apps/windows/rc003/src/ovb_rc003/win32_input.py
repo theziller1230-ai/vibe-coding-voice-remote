@@ -86,6 +86,8 @@ _MOUSEEVENTF_MIDDLEDOWN = 0x0020
 _MOUSEEVENTF_MIDDLEUP = 0x0040
 _MOUSEEVENTF_XDOWN = 0x0080
 _MOUSEEVENTF_XUP = 0x0100
+_MOUSEEVENTF_WHEEL = 0x0800
+_WHEEL_DELTA = 120
 _XBUTTON1 = 0x0001
 _XBUTTON2 = 0x0002
 _VK_LBUTTON = 0x01
@@ -522,6 +524,23 @@ def _real_send_mouse_input_batch(events: Sequence[MouseEvent]) -> int:
     """Submit ordinary mouse events in one real SendInput call."""
 
     return _real_send_input_batch_with_builder(events, _build_mouse_input_array)
+
+
+def send_mouse_wheel(
+    delta: int,
+    *,
+    _sender: Optional[MouseSender] = None,
+) -> None:
+    """Scroll the system wheel by ``delta`` notches.
+
+    ``delta`` follows the Win32 convention: 120 per notch, positive scrolling
+    away from the user.  A wheel event needs no button state, so there is
+    nothing to preflight and nothing to roll back.
+    """
+
+    sender = _sender or _real_send_mouse_input_batch
+    value = int(delta) & 0xFFFFFFFF
+    sender([(_MOUSEEVENTF_WHEEL, value)])
 
 
 def _mouse_button_event(button: str, *, key_up: bool) -> MouseEvent:

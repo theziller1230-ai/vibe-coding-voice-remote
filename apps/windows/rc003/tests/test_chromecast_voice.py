@@ -196,6 +196,40 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(gate.state, "blocked")
         self.assertEqual(gate.stream, (0, 0))
 
+    def test_press_during_stopping_settles_to_idle_and_keyboard_begin_works(self):
+        # An AUDIO_START that lands in cleanup must leave the gate able to
+        # settle; the force-closed press stream may never report a stop.
+        gate = self.open_toggle()
+        gate.finish(2)
+        gate.control(STOP, 2.1)
+        effects = gate.control(PHYSICAL, 2.2)
+        self.assertEqual([e.value for e in effects if e.kind == "device"], [b"\x0d\x01"])
+        self.assertFalse(any(e.kind == "host_start" for e in effects))
+        gate.host_stopped(1, True, 2.6)
+        self.assertEqual(gate.state, "idle")
+        self.assertTrue(any(e.kind == "host_start" for e in gate.begin_host_start(3)))
+
+    def test_press_during_stopping_keeps_quiet_proof_and_cannot_block(self):
+        gate = self.open_toggle()
+        gate.finish(2)
+        gate.control(STOP, 2.1)
+        gate.control(PHYSICAL, 2.2)
+        self.assertEqual(gate.stop_seen, 2.1)  # The press must not lose the proof.
+        gate.host_stopped(1, True, 2.5)
+        gate.tick(20)  # Far beyond STOP_TIMEOUT: cleanup settles, never blocks.
+        self.assertEqual(gate.state, "idle")
+
+    def test_successful_close_settles_gate_and_keyboard_begin_works(self):
+        # A completed close discharges the open liability even when the device
+        # never reports the stop for the closed stream.
+        gate = self.open_toggle()
+        close = next(e for e in gate.finish(2) if e.kind == "device")
+        self.assertTrue(gate.command_submitted(close))
+        self.assertEqual(gate.command_result(close, True, 2.1), [])
+        gate.host_stopped(1, True, 2.5)
+        self.assertEqual(gate.state, "idle")
+        self.assertTrue(any(e.kind == "host_start" for e in gate.begin_host_start(3)))
+
     def test_invalid_clock(self):
         gate = Recording()
         gate.tick(2)

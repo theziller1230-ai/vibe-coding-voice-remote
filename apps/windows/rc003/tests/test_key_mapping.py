@@ -1,6 +1,6 @@
 import unittest
 
-from ovb_rc003 import device_profile, key_mapping
+from ovb_rc003 import device_catalog, device_profile, key_mapping, remote_layout
 
 
 class DefaultButtonActionsTests(unittest.TestCase):
@@ -10,33 +10,46 @@ class DefaultButtonActionsTests(unittest.TestCase):
     def test_covers_exactly_the_defined_default_button_ids(self):
         self.assertEqual(set(self.defaults.keys()), key_mapping.DEFAULT_BUTTON_IDS)
 
-    def test_volume_mute_has_no_default_binding(self):
-        self.assertNotIn("volume_mute", self.defaults)
+    def test_volume_mute_defaults_to_system_volume_mute(self):
+        self.assertEqual(
+            self.defaults["volume_mute"].kind,
+            key_mapping.ActionKind.SYSTEM_VOLUME_MUTE,
+        )
         self.assertIn("volume_mute", device_profile.ALL_BUTTON_IDS)
 
     def test_matches_task_table_exactly(self):
         expected = {
             "mic": (key_mapping.ActionKind.VOICE_HOLD, ()),
             "power": (key_mapping.ActionKind.ESCAPE, ()),
-            "up": (key_mapping.ActionKind.ARROW_UP, ()),
-            "down": (key_mapping.ActionKind.ARROW_DOWN, ()),
+            "up": (key_mapping.ActionKind.MOUSE_WHEEL_UP, ()),
+            "down": (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, ()),
             "left": (key_mapping.ActionKind.ARROW_LEFT, ()),
             "right": (key_mapping.ActionKind.ARROW_RIGHT, ()),
             "ok": (key_mapping.ActionKind.RETURN, ()),
             "back": (key_mapping.ActionKind.DELETE_BACKWARD, ()),
-            "volume_up": (key_mapping.ActionKind.SYSTEM_VOLUME_UP, ()),
-            "volume_down": (key_mapping.ActionKind.SYSTEM_VOLUME_DOWN, ()),
+            "volume_up": (key_mapping.ActionKind.ARROW_UP, ()),
+            "volume_down": (key_mapping.ActionKind.ARROW_DOWN, ()),
+            "volume_mute": (key_mapping.ActionKind.SYSTEM_VOLUME_MUTE, ()),
             "home": (key_mapping.ActionKind.SHOW_DESKTOP, ()),
             "menu": (key_mapping.ActionKind.CONTEXT_MENU, ()),
             "tv": (key_mapping.ActionKind.APP_SWITCHER, ()),
+            "youtube": (key_mapping.ActionKind.KEY_COMBO, ("lctrl", "c")),
+            "netflix": (key_mapping.ActionKind.KEY_COMBO, ("lctrl", "v")),
+            "input_source": (key_mapping.ActionKind.DISABLED, ()),
         }
+        self.assertEqual(set(expected), set(self.defaults))
         for button_id, (kind, keys) in expected.items():
             action = self.defaults[button_id]
             self.assertEqual(action.kind, kind, msg=button_id)
             self.assertEqual(action.keys, keys, msg=button_id)
 
     def test_all_default_button_ids_are_known_buttons(self):
-        self.assertTrue(key_mapping.DEFAULT_BUTTON_IDS.issubset(device_profile.ALL_BUTTON_IDS))
+        # The shared default table spans both supported remotes, so the known
+        # universe is every physical button either profile offers.
+        known = set(remote_layout.button_order(device_catalog.RC003_ID)) | set(
+            remote_layout.button_order(device_catalog.CHROMECAST_ID)
+        )
+        self.assertTrue(key_mapping.DEFAULT_BUTTON_IDS.issubset(known))
 
 
 class ButtonActionSerializationTests(unittest.TestCase):
@@ -66,7 +79,7 @@ class ButtonActionSerializationTests(unittest.TestCase):
             )
             self.assertFalse(key_mapping.action_allows_repeat(action))
 
-    def test_only_navigation_backspace_and_volume_actions_repeat(self):
+    def test_only_navigation_backspace_volume_and_wheel_actions_repeat(self):
         repeatable = {
             key_mapping.ActionKind.ARROW_UP,
             key_mapping.ActionKind.ARROW_DOWN,
@@ -75,6 +88,8 @@ class ButtonActionSerializationTests(unittest.TestCase):
             key_mapping.ActionKind.DELETE_BACKWARD,
             key_mapping.ActionKind.SYSTEM_VOLUME_UP,
             key_mapping.ActionKind.SYSTEM_VOLUME_DOWN,
+            key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
         }
         for action_kind in key_mapping.ActionKind:
             action = (
@@ -115,34 +130,20 @@ class ButtonActionSerializationTests(unittest.TestCase):
                 key_mapping.ButtonAction.from_dict(action.to_dict()), action
             )
 
-    def test_mouse_click_actions_round_trip_as_first_class_actions(self):
+    def test_mouse_actions_round_trip_as_first_class_actions(self):
         for action_kind in (
             key_mapping.ActionKind.MOUSE_LEFT_CLICK,
             key_mapping.ActionKind.MOUSE_RIGHT_CLICK,
             key_mapping.ActionKind.MOUSE_MIDDLE_CLICK,
             key_mapping.ActionKind.MOUSE_X1_CLICK,
             key_mapping.ActionKind.MOUSE_X2_CLICK,
+            key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
         ):
             action = key_mapping.ButtonAction(action_kind)
             self.assertEqual(
                 key_mapping.ButtonAction.from_dict(action.to_dict()), action
             )
-
-    def test_saved_wheel_actions_migrate_to_page_keys_without_writing_wheel(self):
-        for old_kind, page_key in (
-            (key_mapping.ActionKind.MOUSE_WHEEL_UP, "pageup"),
-            (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, "pagedown"),
-        ):
-            with self.subTest(old_kind=old_kind):
-                old_data = {"kind": old_kind.value, "keys": []}
-                restored = key_mapping.ButtonAction.from_dict(old_data)
-                self.assertEqual(restored.kind, key_mapping.ActionKind.KEY_COMBO)
-                self.assertEqual(restored.keys, (page_key,))
-                self.assertEqual(restored.to_dict(), {"kind": "key_combo", "keys": [page_key]})
-                self.assertEqual(
-                    key_mapping.ButtonAction(old_kind).to_dict(),
-                    restored.to_dict(),
-                )
 
     def test_reference_open_app_actions_are_first_class_actions(self):
         for action_kind in (

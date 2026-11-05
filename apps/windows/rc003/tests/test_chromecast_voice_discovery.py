@@ -152,6 +152,30 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(row["protocol_error"], 5 if status == 2 else -1)
                 self.assertEqual(row["outcome"], "success" if status == 0 else "status_failed")
 
+    async def test_unreachable_during_characteristics_is_retryable(self):
+        # The characteristics branch never set the retry flag at all, so it kept
+        # the "False" written at the top of open_voice(). Even a plain
+        # DeviceUnreachable there stayed dead until the app was restarted -
+        # exactly the reported "voice channel unavailable until restart".
+        voice = service()
+        voice.get_characteristics_with_cache_mode_async = mock.AsyncMock(
+            return_value=SimpleNamespace(status=1, characteristics=[]))
+        target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+        with self.assertRaises(PipeError):
+            await target.open_voice(direct=True)
+        self.assertTrue(target.voice_retryable)
+
+    async def test_clean_but_wrong_characteristic_layout_stays_not_retryable(self):
+        # A clean enumeration with the wrong layout is a real incompatibility:
+        # retrying can only ever fail again.
+        voice = service()
+        voice.get_characteristics_with_cache_mode_async = mock.AsyncMock(
+            return_value=SimpleNamespace(status=0, characteristics=[]))
+        target = self.target(lambda _: SimpleNamespace(status=0, services=[voice]))
+        with self.assertRaises(PipeError):
+            await target.open_voice(direct=True)
+        self.assertFalse(target.voice_retryable)
+
     async def test_all_five_connection_attempts_preserve_query_and_cleanup_evidence(self):
         target = self.target(lambda _: SimpleNamespace(status=1, services=[], protocol_error=None))
         rows = []

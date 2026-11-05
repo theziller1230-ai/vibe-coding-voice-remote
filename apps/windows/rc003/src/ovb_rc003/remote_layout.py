@@ -158,11 +158,17 @@ def default_actions(profile: str = "xiaomi-rc003") -> dict:
     from . import key_mapping
     defaults = key_mapping.default_button_actions()
     if profile != "chromecast-remote":
-        return defaults
-    result = {button: defaults.get(button, key_mapping.ButtonAction(key_mapping.ActionKind.DISABLED))
-              for button in button_order(profile)}
-    result["volume_mute"] = key_mapping.ButtonAction(key_mapping.ActionKind.SYSTEM_VOLUME_MUTE)
-    return result
+        # A profile's defaults cover exactly its physical buttons; the shared
+        # table also carries the Google TV remote's dedicated buttons.
+        return {
+            button: action
+            for button, action in defaults.items()
+            if button in set(BUTTON_ORDER)
+        }
+    return {
+        button: defaults.get(button, key_mapping.ButtonAction(key_mapping.ActionKind.DISABLED))
+        for button in button_order(profile)
+    }
 
 
 def hotspot_for(button_id: str, profile: str = "xiaomi-rc003") -> Optional[ButtonHotspot]:

@@ -24,15 +24,15 @@ class ProductIdentityTests(unittest.TestCase):
         version = "1.0.51-candidate.51"
         self.assertEqual(
             product_identity.windows_presentation_label(version),
-            "无线麦 win版 1.0.51-candidate.51",
+            "VCVR 1.0.51-candidate.51",
         )
         self.assertEqual(
             product_identity.windows_executable_name(version),
-            "无线麦 win版 1.0.51-candidate.51.exe",
+            "VCVR 1.0.51-candidate.51.exe",
         )
         self.assertEqual(
             product_identity.windows_portable_folder_name(version),
-            "无线麦 win版 1.0.51-candidate.51",
+            "VCVR 1.0.51-candidate.51",
         )
         self.assertEqual(
             product_identity.windows_fixed_file_version(version),
@@ -44,6 +44,12 @@ class ProductIdentityTests(unittest.TestCase):
         cases = {
             "RemoteMicRC003.exe": "legacy",
             "REMOTEMICRC003.EXE": "legacy",
+            "VCVR 1.0.51-candidate.51.exe": "current",
+            "vcvr 1.0.51-candidate.51.EXE": "current",
+            "VCVR 1.0.51.exe": "current",
+            # Pre-rename executables stay recognized so an existing install's
+            # autostart entry, HID-helper consumers and runtime directory can
+            # still be migrated.
             "无线麦 win版 1.0.51-candidate.51.exe": "current",
             "无线麦 WIN版 1.0.51-candidate.51.EXE": "current",
             "无线麦 win版 1.0.51.exe": "current",
@@ -57,6 +63,13 @@ class ProductIdentityTests(unittest.TestCase):
 
         for name in (
             "RemoteMicRC003-old.exe",
+            "VCVR.exe",
+            "VCVR 1.0.exe",
+            "VCVR 01.0.51.exe",
+            "VCVR 1.0.51-.exe",
+            "C:\\Apps\\VCVR 1.0.51.exe",
+            "..\\VCVR 1.0.51.exe",
+            "VCVR 1.0.51.exe.bak",
             "无线麦 win版.exe",
             "无线麦 win版 1.0.exe",
             "无线麦 win版 01.0.51.exe",
@@ -75,6 +88,12 @@ class ProductIdentityTests(unittest.TestCase):
                 "RemoteMicRC003.exe"
             ),
             Path("_internal"),
+        )
+        self.assertEqual(
+            product_identity.windows_runtime_relative_directory_for_executable(
+                "VCVR 1.0.51-candidate.51.exe"
+            ),
+            Path("程序文件"),
         )
         self.assertEqual(
             product_identity.windows_runtime_relative_directory_for_executable(
@@ -132,26 +151,26 @@ class ProductIdentityTests(unittest.TestCase):
         helper = product_identity.windows_hid_helper_version_metadata(
             "1.0.51-candidate.51"
         )
-        self.assertEqual(main["file_description"], "无线麦 win版 1.0.51-candidate.51")
-        self.assertEqual(main["original_filename"], "无线麦 win版 1.0.51-candidate.51.exe")
+        self.assertEqual(main["file_description"], "VCVR 1.0.51-candidate.51")
+        self.assertEqual(main["original_filename"], "VCVR 1.0.51-candidate.51.exe")
         self.assertEqual(main["internal_name"], "RemoteMicRC003")
-        self.assertEqual(helper["file_description"], "无线麦 权限助手")
+        self.assertEqual(helper["file_description"], "VCVR privilege helper")
         self.assertEqual(helper["original_filename"], "RemoteMicRC003HidHelper.exe")
         self.assertTrue(main["prerelease"])
 
     def test_user_visible_name_has_one_runtime_source(self):
-        self.assertEqual(product_identity.DISPLAY_NAME, "无线麦")
+        self.assertEqual(product_identity.DISPLAY_NAME, "VCVR")
         self.assertEqual(
             settings_ui._action_to_display(
                 key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_REMOTE_MIC)
             ),
-            "打开无线麦",
+            "打开VCVR",
         )
 
         tooltip_default = inspect.signature(
             bridge_tray_windows.BridgeTray
         ).parameters["tooltip"].default
-        self.assertEqual(tooltip_default, "无线麦 · 小米遥控器2 Pro")
+        self.assertEqual(tooltip_default, "VCVR · 小米遥控器2 Pro")
 
     def test_voice_statuses_use_the_display_name(self):
         read_result = voice_hotkey_sync_windows.read_provider_hotkey(

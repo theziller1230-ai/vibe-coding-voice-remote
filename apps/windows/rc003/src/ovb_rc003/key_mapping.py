@@ -7,25 +7,34 @@ data, while :mod:`app` and :mod:`win32_input` execute each action through its
 own platform operation.  ``KEY_COMBO`` remains available for a genuinely
 custom user shortcut and for backward-compatible hand-edited files.
 
-Default table matches the reference app's action choices:
+Default table matches the reference app's action choices, adjusted for the
+default layout this build ships (the table is shared by both supported
+remotes; each profile's surfaces only show its own physical buttons - see
+remote_layout.default_actions):
 
-| RC003 按键 | Windows 候选动作 |
+| 按键 | Windows 候选动作 |
 | --- | --- |
 | 麦克风 | 专用语音生命周期 |
 | 电源 | Escape |
-| 上 / 下 / 左 / 右 | 对应方向动作 |
+| 上 / 下 | 鼠标滚轮上 / 下（D-pad 上下滚动） |
+| 左 / 右 | 对应方向动作 |
 | 确定 | 回车 |
 | 返回 | 退格 |
-| 音量 + / − | 系统音量 + / − |
+| 音量 + / − | 方向上 / 下（侧键保留方向键） |
 | 主页 | 显示桌面 |
 | 菜单 | 右键菜单 |
 | TV | 应用切换 |
+| 静音 | 系统静音 |
+| YouTube / Netflix | Ctrl+C / Ctrl+V |
+| 输入源 | 停用 |
 
-The RC003 HID usage table also defines a "volume_mute" usage (see
-device_profile.BUTTON_USAGE_IDS), but this Windows client documents that the
-physical remote has no dedicated mute key - "系统静音" is only an optional
-assignable action, never a default. This module mirrors that: mute is a valid,
-bindable logical button but intentionally has no default entry.
+The last three rows are the Google TV remote's dedicated buttons. The RC003
+HID usage table also defines a "volume_mute" usage (see
+device_profile.BUTTON_USAGE_IDS), but the physical RC003 has no dedicated mute
+key, so the RC003 profile keeps mute out of its user-facing button lists (see
+remote_layout.BUTTON_HOTSPOTS and settings_ui._USER_FACING_BUTTON_IDS). The
+shared default table still binds mute to "系统静音" for remotes that do carry a
+mute key.
 """
 
 from __future__ import annotations
@@ -232,6 +241,8 @@ REPEATABLE_ACTIONS = frozenset(
         ActionKind.DELETE_BACKWARD,
         ActionKind.SYSTEM_VOLUME_UP,
         ActionKind.SYSTEM_VOLUME_DOWN,
+        ActionKind.MOUSE_WHEEL_UP,
+        ActionKind.MOUSE_WHEEL_DOWN,
     }
 )
 
@@ -360,9 +371,6 @@ class ButtonAction:
     program_path: str = field(default="", repr=False)
 
     def to_dict(self) -> dict:
-        if self.kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
-            page_key = "pageup" if self.kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
-            return {"kind": ActionKind.KEY_COMBO.value, "keys": [page_key]}
         data = {"kind": self.kind.value, "keys": list(self.keys)}
         if self.kind == ActionKind.QUICKER_URI:
             data["uri"] = normalize_quicker_uri(self.uri)
@@ -409,9 +417,6 @@ class ButtonAction:
             program_path = normalize_program_path(program_path)
         elif program_path:
             raise ValueError("non-program action must not contain a program path")
-        if kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
-            page_key = "pageup" if kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
-            return cls(kind=ActionKind.KEY_COMBO, keys=(page_key,))
         return cls(kind=kind, keys=keys, uri=uri, text=text, program_path=program_path)
 
 
@@ -500,8 +505,11 @@ def button_combo_action_for(
     return action
 
 
-# Buttons that have a defined default action out of the box. "volume_mute" is
-# deliberately absent (see module docstring).
+# Buttons that have a defined default action out of the box - exactly the keys
+# of default_button_actions() below. The shared table covers both supported
+# remotes: the RC003's 13 buttons plus the Google TV remote's mute, YouTube,
+# Netflix and source-switch keys (the RC003 has no physical mute key; see the
+# module docstring).
 DEFAULT_BUTTON_IDS = frozenset(
     {
         "mic",
@@ -514,9 +522,13 @@ DEFAULT_BUTTON_IDS = frozenset(
         "back",
         "volume_up",
         "volume_down",
+        "volume_mute",
         "home",
         "menu",
         "tv",
+        "youtube",
+        "netflix",
+        "input_source",
     }
 )
 
@@ -525,15 +537,24 @@ def default_button_actions() -> Dict[str, ButtonAction]:
     return {
         "mic": voice_action_for_trigger_mode(VoiceTriggerMode.HOLD),
         "power": ButtonAction(ActionKind.ESCAPE),
-        "up": ButtonAction(ActionKind.ARROW_UP),
-        "down": ButtonAction(ActionKind.ARROW_DOWN),
         "left": ButtonAction(ActionKind.ARROW_LEFT),
         "right": ButtonAction(ActionKind.ARROW_RIGHT),
         "ok": ButtonAction(ActionKind.RETURN),
         "back": ButtonAction(ActionKind.DELETE_BACKWARD),
-        "volume_up": ButtonAction(ActionKind.SYSTEM_VOLUME_UP),
-        "volume_down": ButtonAction(ActionKind.SYSTEM_VOLUME_DOWN),
+        # D-pad up/down scroll like a mouse wheel (the layout this build ships
+        # with); the side rocker keeps the plain arrow keys.
+        "up": ButtonAction(ActionKind.MOUSE_WHEEL_UP),
+        "down": ButtonAction(ActionKind.MOUSE_WHEEL_DOWN),
+        "volume_up": ButtonAction(ActionKind.ARROW_UP),
+        "volume_down": ButtonAction(ActionKind.ARROW_DOWN),
+        "volume_mute": ButtonAction(ActionKind.SYSTEM_VOLUME_MUTE),
         "home": ButtonAction(ActionKind.SHOW_DESKTOP),
         "menu": ButtonAction(ActionKind.CONTEXT_MENU),
         "tv": ButtonAction(ActionKind.APP_SWITCHER),
+        # Local preference of this build: map the two dedicated streaming
+        # buttons to the copy/paste shortcuts a Vibe-Coding workflow uses most,
+        # and leave the source-switch button disabled.
+        "youtube": ButtonAction(ActionKind.KEY_COMBO, ("lctrl", "c")),
+        "netflix": ButtonAction(ActionKind.KEY_COMBO, ("lctrl", "v")),
+        "input_source": ButtonAction(ActionKind.DISABLED),
     }

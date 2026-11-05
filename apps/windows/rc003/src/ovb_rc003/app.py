@@ -71,6 +71,7 @@ from . import (
     button_combo,
     button_gesture,
     chromecast_host_activity,
+    voice_hotkey_stream_windows,
     chromecast_runtime,
     config,
     connection_supervisor,
@@ -189,6 +190,10 @@ _ORDINARY_MIC_SOURCE_STALE_SECONDS = 2.0
 _ORDINARY_MIC_MAX_SECONDS = 10.0
 _KEY_DETECTION_SUPPRESSION_MAX_SECONDS = 2.0
 _RUNTIME_STATUS_HEARTBEAT_SECONDS = 5.0
+# How long the remote mic stays streaming after Doubao stops capturing.
+# Long enough that dictating in bursts never pays the ~300 ms re-open again,
+# short enough that an idle remote stops draining its battery.
+_DOUBAO_STREAM_TAIL_SECONDS = 15.0
 _VOICE_HOLD_SAFETY_SECONDS = 120.0
 _VOICE_KEY_PHYSICALIZER_RETRY_SECONDS = 1.0
 _VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS = 10.0
@@ -345,6 +350,7 @@ class RC003App:
         self._voice_focus_submit_method = ""
         self._voice_text_observation = "unknown"
         self._doubao_session = rc003_doubao_session.DoubaoSessionCoordinator()
+        self._hotkey_stream_watcher = None
         self._doubao_capture_watch_factory = lambda target_pid: (
             chromecast_host_activity.CaptureWatch(
                 reader=lambda: chromecast_host_activity.read_doubao_capture_for_pid(
@@ -600,6 +606,7 @@ class RC003App:
         )
         try:
             if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
+                self._start_voice_hotkey_stream_watch()
                 await self._chromecast_runtime.run()
                 return
             self._start_input_channels()
@@ -609,6 +616,7 @@ class RC003App:
                 if self._remote_profile != remote_selection.CHROMECAST_PROFILE:
                     self._stop_input_channels()
             finally:
+                self._stop_voice_hotkey_stream_watch()
                 element_navigation_runtime.clear_diagnostic_trace(self._diagnostic_trace)
                 self._diagnostic_trace.close()
                 heartbeat.cancel()
@@ -632,8 +640,78 @@ class RC003App:
     def _release_wetype_voice_keys(self, tokens):
         win32_input.send_wetype_voice_key_combo_up(tokens)
 
+    def _start_voice_hotkey_stream_watch(self) -> None:
+        """Open the remote mic stream on the physical voice hotkey.
 
+        Doubao's own shortcut can start a dictation without the remote button,
+        and then CABLE Output has no audio. Watching the physical key edge lets
+        both entry points behave identically, with no polling and no added
+        latency, and the stream stays closed while nobody dictates.
+        """
 
+        if self._hotkey_stream_watcher is not None:
+            return
+        self._logger.info("voice hotkey stream watch: starting")
+        try:
+            settings = self._config
+            shortcut = ""
+            # The physical key is the same whichever mode owns it; a profile
+            # that only configured the hold shortcut must still be watched.
+            for trigger in ("toggle", "hold"):
+                try:
+                    shortcut = config.voice_hotkey_for_provider(
+                        settings,
+                        voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
+                        trigger=trigger,
+                    )
+                except Exception:
+                    shortcut = ""
+                if shortcut:
+                    break
+            if not shortcut and isinstance(settings, dict):
+                shortcut = settings.get("voice_hotkey", "")
+            spec = hotkey.HotkeySpec.parse(shortcut)
+            vk_codes = win32_keys.resolve_vk_codes((*spec.modifiers, spec.key))
+        except Exception:
+            self._logger.exception("voice hotkey stream watch unavailable")
+            return
+        watcher = voice_hotkey_stream_windows.VoiceHotkeyStreamWatcher(
+            vk_codes,
+            self._on_voice_hotkey_stream_press,
+            self._on_voice_hotkey_stream_release,  # no-op: toggle mode ends on capture, not on key-up
+            logger=self._logger,
+        )
+        self._logger.info(f"voice hotkey stream watch: vk_codes={vk_codes}")
+        if watcher.start():
+            self._hotkey_stream_watcher = watcher
+
+    def _stop_voice_hotkey_stream_watch(self) -> None:
+        watcher, self._hotkey_stream_watcher = self._hotkey_stream_watcher, None
+        if watcher is not None:
+            watcher.stop()
+
+    def _on_voice_hotkey_stream_press(self) -> None:
+        host = getattr(self._chromecast_runtime, "voice_host", None)
+        self._logger.info(
+            "voice hotkey edge: host_ready=%s state=%s",
+            host is not None,
+            getattr(host, "state", "unavailable"),
+        )
+        if host is None:
+            self._logger.warning(
+                "physical voice hotkey ignored; the voice host is not running")
+            return
+        if host.enqueue_keyboard_start():
+            self._logger.info(
+                "physical voice hotkey registered with the voice host")
+        else:
+            self._logger.warning(
+                "physical voice hotkey dropped; the voice host is stopping")
+
+    def _on_voice_hotkey_stream_release(self) -> None:
+        # Doubao's toggle mode keeps recording after the key is released, so the
+        # capture watch decides when the attempt ends. Nothing to do here.
+        return
 
     async def _runtime_status_heartbeat(self) -> None:
         while True:
@@ -4620,16 +4698,8 @@ class RC003App:
             button_id,
             key_mapping.ButtonTrigger.SINGLE_CLICK,
         )
-        if button_id not in {
-            "up",
-            "down",
-            "left",
-            "right",
-            "back",
-            "volume_up",
-            "volume_down",
-        }:
-            return False
+        # Any button may repeat; the action kind alone decides whether replay
+        # is meaningful (arrows, backspace, volume, wheel).
         return key_mapping.action_allows_repeat(action)
 
     def _button_repeat_interval(self, button_id: str, repeat_count: int) -> float:
@@ -4645,6 +4715,13 @@ class RC003App:
             key_mapping.ActionKind.ARROW_RIGHT,
         }:
             return _DIRECTION_BUTTON_REPEAT_INTERVAL_SECONDS
+        if action.kind in {
+            key_mapping.ActionKind.MOUSE_WHEEL_UP,
+            key_mapping.ActionKind.MOUSE_WHEEL_DOWN,
+        }:
+            # A wheel notch is 120 units; 60 ms reads as smooth scrolling
+            # rather than a stutter.
+            return 0.060
         if button_id == "back":
             return button_gesture.ButtonGestureDispatcher.BACK_REPEAT_INTERVAL_SECONDS
         return button_gesture.ButtonGestureDispatcher.REPEAT_INTERVAL_SECONDS
@@ -4774,6 +4851,10 @@ class RC003App:
                 win32_input.send_context_menu()
             elif action.kind == key_mapping.ActionKind.APP_SWITCHER:
                 win32_input.send_app_switcher()
+            elif action.kind == key_mapping.ActionKind.MOUSE_WHEEL_UP:
+                win32_input.send_mouse_wheel(120)
+            elif action.kind == key_mapping.ActionKind.MOUSE_WHEEL_DOWN:
+                win32_input.send_mouse_wheel(-120)
             elif action.kind == key_mapping.ActionKind.SYSTEM_VOLUME_UP:
                 win32_input.send_volume_up()
             elif action.kind == key_mapping.ActionKind.SYSTEM_VOLUME_DOWN:

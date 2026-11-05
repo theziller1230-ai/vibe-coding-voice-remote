@@ -13539,7 +13539,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertTrue(data["recording_before_stop_completed"])
         self.assertEqual(data["pending_before_stop_completed"], "ctrl+shift+f8")
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
-        self.assertIn("快捷键已保存到无线麦", data["voice_save_status"])
+        self.assertIn("快捷键已保存到VCVR", data["voice_save_status"])
         self.assertFalse(data["voice_feedback_on_device"])
         self.assertTrue(data["voice_feedback_on_voice"])
         self.assertTrue(data["mapping_dirty_on_buttons"])

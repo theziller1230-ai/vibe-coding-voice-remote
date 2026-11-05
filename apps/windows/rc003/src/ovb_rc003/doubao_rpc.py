@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import sys
 import threading
@@ -109,6 +110,95 @@ _VERIFIED_VOICE_STOP_BUILDS = {
         1,
     ),
 }
+_EXTERNAL_PROFILE_NAME = "doubao_profiles.json"
+
+
+def _external_profile_paths() -> Tuple[Path, ...]:
+    """Where a user-supplied Doubao build profile may live.
+
+    A new Doubao release changes the three hook RVAs and all file hashes, so the
+    built-in tables have to be extended.  Requiring a rebuild for that is
+    needless: the same facts can live in a JSON file next to the executable, so
+    adapting to a Doubao update is "write the file, restart the app".
+    """
+
+    candidates = []
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        candidates.append(Path(base) / "RemoteMic" / "RC003" / _EXTERNAL_PROFILE_NAME)
+    try:
+        candidates.append(Path(sys.executable).resolve().parent / _EXTERNAL_PROFILE_NAME)
+    except (OSError, ValueError):
+        pass
+    if not getattr(sys, "frozen", False):
+        candidates.append(Path(__file__).resolve().parent / _EXTERNAL_PROFILE_NAME)
+    return tuple(dict.fromkeys(candidates))
+
+
+def _merge_external_profiles() -> None:
+    """Merge doubao_profiles.json into the verified tables (best effort).
+
+    Schema::
+
+        {
+          "ime_builds": {
+            "<ImeService.exe sha256>": {
+              "layout": [callback, forward, continue, gate, stack],
+              "sig0": "40 55 56 57 ...", "sig1": "FF 15 ..."
+            }
+          },
+          "voice_stop_builds": {
+            "<rpc.dll sha256>": ["<ImeService sha256>", "<tsf-oime-core sha256>", 1]
+          }
+        }
+
+    Anything malformed is ignored: a broken file must never stop the app from
+    starting with its built-in tables.
+    """
+
+    for path in _external_profile_paths():
+        try:
+            if not path.is_file():
+                continue
+            with open(path, encoding="utf-8") as stream:
+                data = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        for digest, entry in (data.get("ime_builds") or {}).items():
+            if not isinstance(digest, str) or len(digest) != 64:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            layout = entry.get("layout")
+            if not (isinstance(layout, list) and len(layout) == 5
+                    and all(type(part) is int for part in layout)):
+                continue
+            try:
+                sig0 = bytes.fromhex(entry["sig0"])
+                sig1 = bytes.fromhex(entry["sig1"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = tuple(layout)
+            _VERIFIED_IME_SERVICE_BUILDS[digest.lower()] = key
+            _VERIFIED_FORWARD_ONLY_SIGNATURES[key] = (sig0, sig1)
+
+        for digest, entry in (data.get("voice_stop_builds") or {}).items():
+            if not isinstance(digest, str) or len(digest) != 64:
+                continue
+            if not (isinstance(entry, list) and len(entry) == 3):
+                continue
+            ime, tsf, wparam = entry
+            if not (isinstance(ime, str) and isinstance(tsf, str)
+                    and type(wparam) is int and 0 <= wparam <= 0xFFFF):
+                continue
+            _VERIFIED_VOICE_STOP_BUILDS[digest.lower()] = (ime.lower(), tsf.lower(), wparam)
+
+
+_merge_external_profiles()
+
 _PHYSICALIZER_READY_TIMEOUT_SECONDS = 2.0
 _MARKER_CONFIRM_TIMEOUT_SECONDS = 0.75
 _diagnostic_trace: Optional[diagnostic_trace.DiagnosticTrace] = None
@@ -996,6 +1086,33 @@ def physicalizer_error() -> Optional[str]:
     return _physicalizer.error
 
 
+def _active_version_directory() -> Optional[Path]:
+    """The version tree the Doubao bootstrap actually loads.
+
+    Picking the newest directory on disk is wrong: an update can leave a newer
+    tree behind while the service in the pipe still runs an older build, and
+    then the RPC layout we verify does not match the server we talk to.  The
+    bootstrap records the real choice in HKLM\\SOFTWARE\\DoubaoIme\\VersionDir.
+    """
+
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\DoubaoIme",
+        ) as key:
+            value, _kind = winreg.QueryValueEx(key, "VersionDir")
+    except OSError:
+        return None
+    if not isinstance(value, str) or not value:
+        return None
+    directory = Path(value)
+    return directory if directory.is_dir() else None
+
+
 def _candidate_dll_paths() -> Tuple[str, ...]:
     roots = []
     for variable in ("ProgramFiles", "ProgramW6432"):
@@ -1005,8 +1122,11 @@ def _candidate_dll_paths() -> Tuple[str, ...]:
     roots.append(Path(r"C:\Program Files") / "DoubaoIME")
 
     paths = []
+    active = _active_version_directory()
     for root in dict.fromkeys(roots):
         paths.append(str(root / _RPC_DLL_NAME))
+        if active is not None:
+            paths.append(str(active / _RPC_DLL_NAME))
         versions = root / "versions"
         try:
             version_directories = [item for item in versions.iterdir() if item.is_dir()]

@@ -226,9 +226,15 @@ class Channel:
                     raise ChannelError("invalid_voice_cancel")
             elif kind == "voice_host":
                 expected.update(("attempt", "result"))
-                if (self.mode != "run" or not self.voice_enabled or type(message.get("attempt")) is not int
-                        or not 1 <= message["attempt"] <= 2**31
-                        or message.get("result") not in ("ready", "failed", "released", "release_failed", "stop")):
+                attempt, result = message.get("attempt"), message.get("result")
+                if (self.mode != "run" or not self.voice_enabled or type(attempt) is not int
+                        or not 0 <= attempt <= 2**31
+                        or result not in ("begin", "ready", "failed", "released",
+                                          "release_failed", "stop")):
+                    raise ChannelError("invalid_voice_host")
+                # ``begin`` opens a host-initiated attempt and has no attempt of
+                # its own yet; every other reply reports on an existing one.
+                if result != "begin" and attempt < 1:
                     raise ChannelError("invalid_voice_host")
             elif kind not in ("stop", "heartbeat") or self.sequence == 0:
                 raise ChannelError("invalid_command")

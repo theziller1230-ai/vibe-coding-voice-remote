@@ -12,15 +12,25 @@ from pathlib import Path, PurePath
 from typing import Any
 
 
-DISPLAY_NAME = "无线麦"
-WINDOWS_EDITION_NAME = "win版"
-WINDOWS_PRODUCT_NAME = f"{DISPLAY_NAME} {WINDOWS_EDITION_NAME}"
+# VCVR = Vibe Coding Voice Remote (Windows).  The Chinese consumer name of the
+# upstream build is deliberately dropped: this fork ships a different default
+# key layout and a different Doubao compatibility table.
+DISPLAY_NAME = "VCVR"
+WINDOWS_EDITION_NAME = ""
+WINDOWS_PRODUCT_NAME = (
+    DISPLAY_NAME if not WINDOWS_EDITION_NAME
+    else f"{DISPLAY_NAME} {WINDOWS_EDITION_NAME}"
+)
 LEGACY_WINDOWS_EXECUTABLE_NAME = "RemoteMicRC003.exe"
+# Executables named after the pre-rename product keep matching exactly: an
+# existing install's autostart entry, HID-helper consumer markers and bundled
+# runtime directory can only be migrated while the old name stays recognized.
+PREVIOUS_WINDOWS_PRODUCT_NAME = "无线麦 win版"
 WINDOWS_RUNTIME_DIRECTORY_NAME = "程序文件"
 WINDOWS_DOCUMENTATION_DIRECTORY_NAME = "说明与许可"
 WINDOWS_PORTABLE_README_NAME = "使用说明.txt"
 HID_HELPER_EXECUTABLE_NAME = "RemoteMicRC003HidHelper.exe"
-HID_HELPER_FILE_DESCRIPTION = f"{DISPLAY_NAME} 权限助手"
+HID_HELPER_FILE_DESCRIPTION = f"{DISPLAY_NAME} privilege helper"
 WINDOWS_INTERNAL_NAME = "RemoteMicRC003"
 
 _VERSION_PATTERN = re.compile(
@@ -29,9 +39,12 @@ _VERSION_PATTERN = re.compile(
     r"(?P<patch>0|[1-9][0-9]*)"
     r"(?:-(?P<suffix>[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*))?"
 )
-_WINDOWS_EXECUTABLE_PATTERN = re.compile(
-    rf"{re.escape(WINDOWS_PRODUCT_NAME)} (?P<version>.+)\.exe",
-    re.IGNORECASE,
+_WINDOWS_EXECUTABLE_PATTERNS = tuple(
+    re.compile(
+        rf"{re.escape(product_name)} (?P<version>.+)\.exe",
+        re.IGNORECASE,
+    )
+    for product_name in (WINDOWS_PRODUCT_NAME, PREVIOUS_WINDOWS_PRODUCT_NAME)
 )
 _WINDOWS_VERSION_COMPONENT_MAX = 65_535
 
@@ -91,14 +104,16 @@ def recognized_windows_executable_layout(name: str) -> str | None:
         return None
     if name.casefold() == LEGACY_WINDOWS_EXECUTABLE_NAME.casefold():
         return "legacy"
-    match = _WINDOWS_EXECUTABLE_PATTERN.fullmatch(name)
-    if match is None:
-        return None
-    try:
-        validate_version(match.group("version"))
-    except (TypeError, ValueError):
-        return None
-    return "current"
+    for pattern in _WINDOWS_EXECUTABLE_PATTERNS:
+        match = pattern.fullmatch(name)
+        if match is None:
+            continue
+        try:
+            validate_version(match.group("version"))
+        except (TypeError, ValueError):
+            continue
+        return "current"
+    return None
 
 
 def is_recognized_windows_executable_name(name: str) -> bool:

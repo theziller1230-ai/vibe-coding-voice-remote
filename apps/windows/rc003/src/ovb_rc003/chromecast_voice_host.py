@@ -38,6 +38,19 @@ from . import bridge_runtime_status as status, voice_controller, key_detection_b
 # 50 worker slots; live audio uses the same 100 ms blocks to preserve headroom.
 _OUTPUT_BLOCK_SAMPLES = 1600
 _MAX_STARTUP_SAMPLES = 80000
+# A non-WeType startup confirms in well under a second, and every attempt that
+# sits in "starting" freezes both entry points meanwhile, so those fail fast
+# instead of waiting out the ready window.
+_STARTUP_CONFIRM_SECONDS = 2.0
+# Both WeType modes confirm slow hold-observer captures late; only they keep
+# the receiver's ready deadline as their startup limit.
+_PROTOCOL_READY_SECONDS = 9.0
+# The toggle hotkey is the only way Doubao starts. If the engine is still
+# settling from a previous stop when the key is delivered the press is lost and
+# the attempt waits for a capture that never comes, so re-send it once - and
+# only while Doubao verifiably is not capturing, since a stray tap would switch
+# a running dictation straight off again.
+_START_KEY_RETRY_SECONDS = 1.5
 
 
 @dataclass(frozen=True)
@@ -104,6 +117,10 @@ class VoiceHost:
         self._doubao_physicalizer_generation = None
         self._doubao_handsfree = False
         self._doubao_finish_attempted = False
+        self._keyboard_initiated_until = 0.0
+        self._pending_keyboard_start_at = 0.0
+        self._last_shortcut_send_at = 0.0
+        self._start_key_resent = False
         self._settings_claimed = False
         self._cancelled_attempts = set()
 
@@ -177,14 +194,105 @@ class VoiceHost:
         if self.client and self.attempt:
             self.client.voice_host(self.attempt, result)
 
+    def _doubao_capture_active(self):
+        """True/False for Doubao's live capture, or None when it cannot be read.
+
+        A capture watch that already saw the session disappear is the stronger
+        signal and wins over a fresh read, which can still list the very session
+        that is winding down.
+        """
+        watch = self.capture_watch
+        if watch is not None and watch.ended:
+            return False
+        try:
+            return any(item.state == 1 for item in read_doubao_capture())
+        except Exception:
+            return None
+
     def _attempt_cancelled(self, attempt):
         with self._input_lock:
             return attempt in self._cancelled_attempts
+
+    def enqueue_keyboard_start(self):
+        """Register a dictation the keyboard hotkey started.
+
+        Called from the low-level keyboard hook thread.  ``enqueue`` is the
+        thread-safe entry the pipe already uses, so this adds no new sharing.
+        """
+        if self.stopping.is_set():
+            return False
+        try:
+            with self._input_lock:
+                self.events.put_nowait({"event": "keyboard_start", "attempt": 0,
+                                        "data": "", "_input_epoch": self.input_epoch,
+                                        "_received_at": time.monotonic()})
+            return True
+        except queue.Full:
+            return False
+
+    def _consume_keyboard_initiated(self):
+        until, self._keyboard_initiated_until = self._keyboard_initiated_until, 0.0
+        return bool(until and time.monotonic() <= until)
+
+    def _keyboard_start(self, received_at=None):
+        # Our own synthesized hotkey looks exactly like a hardware edge once an
+        # earlier hook has cleared its injection marker, so a start that lands
+        # right after we sent the key is never a user's press.
+        now = time.monotonic() if received_at is None else received_at
+        if self._last_shortcut_send_at and now - self._last_shortcut_send_at < 0.5:
+            return
+        if self.state == "idle" and self.closed:
+            # Only the recording attempt is missing: Windows already delivered
+            # the physical hotkey, so Doubao is starting on its own and must not
+            # be toggled a second time.
+            self._begin_keyboard_attempt()
+            return
+        if self.state in ("stopping", "starting"):
+            # Windows already delivered this key to Doubao, so a dictation no
+            # attempt serves may now be running: after "stopping" Doubao takes a
+            # fresh start; during "starting" the press retries one whose attempt
+            # has not confirmed.  Keep one pending start (a newer press replaces
+            # it) that fires at idle; an attempt that recovers and records has
+            # served it instead.
+            self._pending_keyboard_start_at = now
+            self.services.logger.info(
+                "Chromecast voice: keyboard hotkey queued during attempt=%s state=%s",
+                self.attempt, self.state)
+            return
+        # Already recording: the physical key toggles Doubao off and the
+        # capture watch closes the attempt, so there is nothing to begin.
+        self.services.logger.info(
+            "Chromecast voice: keyboard hotkey during attempt=%s state=%s",
+            self.attempt, self.state)
+
+    def _begin_keyboard_attempt(self):
+        self._keyboard_initiated_until = time.monotonic() + 3.0
+        self.services.logger.info(
+            "Chromecast voice: keyboard hotkey requested a recording attempt")
+        if self.client:
+            self.client.voice_host(self.attempt or 0, "begin")
+
+    def _fire_pending_keyboard_start(self):
+        # Fire the press queued while the previous attempt wound down or sat
+        # unconfirmed in "starting", so the dictation Doubao already began gets
+        # an attempt and its MIC_OPEN.  Re-validate at fire time: a host that is
+        # busy again or shutting down must not gain an attempt, so drop with a
+        # log instead of forcing one open.
+        if not self._pending_keyboard_start_at:
+            return
+        self._pending_keyboard_start_at = 0.0
+        if self.state != "idle" or not self.closed or self.stopping.is_set():
+            self.services.logger.info(
+                "Chromecast voice: queued keyboard hotkey dropped: attempt=%s state=%s",
+                self.attempt, self.state)
+            return
+        self._begin_keyboard_attempt()
 
     def _start_host(self, attempt, input_epoch=None):
         services = self.services
         if self.state != "idle" or not self.closed or attempt <= self.attempt:
             return
+        keyboard_initiated = self._consume_keyboard_initiated()
         # Refresh before claiming the settings services.  Once claimed, a reload
         # can only become pending, so provider/mode/backend/hotkey cannot be
         # mixed across one attempt.
@@ -201,6 +309,7 @@ class VoiceHost:
             self.failure_result = None
             self.capture_watch = None
             self._capture_watch_status = None
+            self._start_key_resent = False
             self._tracking_loss_seen = False
             self._tracking_loss_at = 0.0
             self._tracking_keys_released = False
@@ -271,7 +380,13 @@ class VoiceHost:
                 self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
                 and trigger == "toggle"
             ):
-                self._start_doubao_handsfree(input_epoch)
+                self._start_doubao_handsfree(
+                    input_epoch, keyboard_initiated=keyboard_initiated)
+                return
+            if keyboard_initiated:
+                # Re-sending the hotkey here would switch the engine straight
+                # back off, and no other provider is reached from the keyboard.
+                self._fail_voice("键盘触发目前仅支持豆包免按模式。")
                 return
             if self.provider == voice_program_manager.VOICE_PROGRAM_CHATTERFLY:
                 self._start_chatterfly(input_epoch, trigger)
@@ -378,7 +493,7 @@ class VoiceHost:
             self.attempt,
         )
 
-    def _start_doubao_handsfree(self, input_epoch):
+    def _start_doubao_handsfree(self, input_epoch, *, keyboard_initiated=False):
         services = self.services
         shortcut = config.voice_hotkey_for_provider(
             services.settings(),
@@ -391,19 +506,24 @@ class VoiceHost:
         try:
             spec = hotkey.HotkeySpec.parse(shortcut)
             tokens = (*spec.modifiers, spec.key)
-            if any(item.state == 1 for item in read_doubao_capture()):
-                self._fail_voice("豆包已有未结束的语音采集；本次未发送启动快捷键。")
-                return
+            already_capturing = any(item.state == 1 for item in read_doubao_capture())
         except Exception:
             self._fail_voice("豆包采集状态无法确认；本次未发送启动快捷键。")
             return
+        # The physical hotkey starts Doubao by itself, so this attempt must
+        # adopt the capture instead of re-sending the toggle hotkey - doing
+        # that would switch the engine straight back off.  An already active
+        # capture is adopted the same way whatever started it, which is what
+        # keeps the keyboard and the remote from fighting over one engine.
+        adopt = keyboard_initiated or already_capturing
         backend = services.configured_backend()
-        if not win32_input.can_begin_tracked_hold(tokens):
-            self._fail_voice("keyboard safety tracking is unavailable; shortcut was not sent")
-            return
-        if not services.ensure_key_tracking(tokens, backend):
-            self._fail_voice("豆包按键跟踪不可用；未发送免按模式快捷键。")
-            return
+        if not adopt:
+            if not win32_input.can_begin_tracked_hold(tokens):
+                self._fail_voice("keyboard safety tracking is unavailable; shortcut was not sent")
+                return
+            if not services.ensure_key_tracking(tokens, backend):
+                self._fail_voice("豆包按键跟踪不可用；未发送免按模式快捷键。")
+                return
         if not services.audio.open():
             self._fail_voice("audio output could not open", status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED)
             return
@@ -414,7 +534,8 @@ class VoiceHost:
             effective_backend=backend,
         )
         self.diagnostic_started = True
-        self.capture_watch = CaptureWatch(read_doubao_capture, fast_start=True)
+        self.capture_watch = CaptureWatch(read_doubao_capture, fast_start=True,
+                                         adopt_existing=adopt)
         self.capture_watch.begin()
         cancelled = lambda: (
             self.stopping.is_set()
@@ -424,28 +545,30 @@ class VoiceHost:
         )
         if cancelled():
             return
-        down = services.shortcut.controller.on_mic_button_pressed()
-        delivered = services.shortcut.apply(
-            down,
-            backend_override=backend,
-            tokens_override=tokens,
-            cancelled=cancelled,
-        )
-        self._doubao_physicalizer_generation = services.shortcut.doubao_physicalizer.generation
-        if not delivered:
-            services.shortcut.controller.cancel_pending()
-            self._fail_voice("豆包免按模式启动快捷键未成功发送。")
-            return
-        up = services.shortcut.controller.on_mic_button_released()
-        if up is None or not services.shortcut.apply(
-            up,
-            backend_override=backend,
-            tokens_override=tokens,
-        ):
-            if up is not None:
-                services.shortcut.controller.restore_pending(up)
-            self._fail_voice("豆包免按模式启动快捷键未完整释放。")
-            return
+        if not adopt:
+            down = services.shortcut.controller.on_mic_button_pressed()
+            delivered = services.shortcut.apply(
+                down,
+                backend_override=backend,
+                tokens_override=tokens,
+                cancelled=cancelled,
+            )
+            self._doubao_physicalizer_generation = services.shortcut.doubao_physicalizer.generation
+            self._last_shortcut_send_at = time.monotonic()
+            if not delivered:
+                services.shortcut.controller.cancel_pending()
+                self._fail_voice("豆包免按模式启动快捷键未成功发送。")
+                return
+            up = services.shortcut.controller.on_mic_button_released()
+            if up is None or not services.shortcut.apply(
+                up,
+                backend_override=backend,
+                tokens_override=tokens,
+            ):
+                if up is not None:
+                    services.shortcut.controller.restore_pending(up)
+                self._fail_voice("豆包免按模式启动快捷键未完整释放。")
+                return
         self._hold_backend = backend
         self._hold_tokens = tokens
         self._doubao_handsfree = True
@@ -455,9 +578,9 @@ class VoiceHost:
         services.set_active(True)
         services.set_result(status.VOICE_RUNTIME_ACTIVE)
         services.logger.info(
-            "Chromecast Doubao hands-free attempt=%s action=start sent_once=True "
-            "keys_released=True capture_state=%s",
-            self.attempt,
+            "Chromecast Doubao hands-free attempt=%s action=start sent_once=%s "
+            "keys_released=%s adopted=%s capture_state=%s",
+            self.attempt, not adopt, not adopt, adopt,
             self.capture_watch.status,
         )
 
@@ -684,14 +807,20 @@ class VoiceHost:
                         and self._toggle is not None and not self._toggle_stop_sent
                         and not self._sogou_finish_attempted and not self.closed
                         and self.engaged and self.state == "recording")
+        # Doubao's hands-free mode is a toggle on its shortcut: an attempt that
+        # leaves a capture running makes the NEXT press switch it off instead of
+        # starting a dictation, so no voice bar appears at all.  Ask the engine
+        # whether a capture is still live rather than guessing from the stop
+        # reason - a teardown during "starting", a device_ended and a writer
+        # failure all leak one.
+        doubao_capture_live = self._doubao_capture_active()
         finish_doubao = (
-            reason in ("second_press", "time_limit")
-            and self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
+            self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
             and self._doubao_handsfree
             and not self._doubao_finish_attempted
             and not self.closed
             and self.engaged
-            and self.state == "recording"
+            and doubao_capture_live is not False
         )
         capture_identity = self.capture_watch.identity if self.capture_watch is not None else None
         if finish_sogou:
@@ -808,6 +937,24 @@ class VoiceHost:
                         cancel_event=self.stopping,
                     )
                 )
+            # Doubao's hands-free mode is a toggle on its voice shortcut, so
+            # the private stop RPC is only an optimisation. When a Doubao build
+            # rejects that RPC - or when it is never reached - the capture stays
+            # open, every later attempt is refused with "已有未结束的语音采集",
+            # and the user has to restart the IME. Re-send the same physicalized
+            # edge that started the capture: the physicalizer is still bound
+            # from the start, so Doubao treats it as a real key press. Only do
+            # it while a capture is verifiably live - a stray tap would START a
+            # dictation the user never asked for.
+            if self._hold_tokens and (outcome == "send_failed"
+                                     or self._doubao_capture_active() is True):
+                try:
+                    win32_input.send_voice_key_combo_tap(
+                        tuple(self._hold_tokens), physicalize=True)
+                    outcome = "send_failed_shortcut_fallback"
+                except Exception:
+                    services.logger.exception(
+                        "Doubao stop shortcut fallback failed; capture may stay open")
             services.logger.info(
                 "Chromecast Doubao hands-free finish attempt=%s reason=%s "
                 "result=%s private_rpc=True retry=False completion=unobserved",
@@ -838,6 +985,9 @@ class VoiceHost:
         if kind == "host_start":
             self._start_host(attempt, event.get("_input_epoch"))
             return
+        if kind == "keyboard_start":
+            self._keyboard_start(event.get("_received_at"))
+            return
         if attempt != self.attempt:
             return
         if kind == "host_stop":
@@ -851,9 +1001,14 @@ class VoiceHost:
             if event["data"] == "idle" and self.closed:
                 self.state = "idle"
                 self.decoder = None
+                self._fire_pending_keyboard_start()
             elif (not self._attempt_cancelled(attempt)
                   and event["data"] == "recording" and self.confirmed):
                 self.state = "recording"
+                # This recording serves the dictation a queued press started
+                # (the attempt recovered by adopting Doubao's capture), so the
+                # pending start is done and nothing may reopen it later.
+                self._pending_keyboard_start_at = 0.0
         elif kind == "control" and self.decoder and self.state in ("starting", "recording"):
             if self._attempt_cancelled(attempt):
                 return
@@ -961,6 +1116,26 @@ class VoiceHost:
         if self.engaged and not self.closed and self.capture_watch is not None:
             ended = self.capture_watch.poll(now)
             current = self.capture_watch.status
+            if (current in ("waiting", "ambiguous") and not self._start_key_resent
+                    and self._doubao_handsfree
+                    and self.provider == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
+                    and self._hold_tokens and now - self.start_at >= _START_KEY_RETRY_SECONDS
+                    and self._doubao_capture_active() is False):
+                # The first tap was lost (the engine was still settling) or it
+                # was never sent (the keyboard-initiated marker was consumed by
+                # an earlier start). Either way Doubao is idle, so re-sending the
+                # toggle starts it - and only then.
+                self._start_key_resent = True
+                self._last_shortcut_send_at = now
+                try:
+                    win32_input.send_voice_key_combo_tap(
+                        tuple(self._hold_tokens), physicalize=True)
+                    self.services.logger.info(
+                        "Chromecast voice: resent the Doubao start shortcut "
+                        "attempt=%s capture_state=%s", self.attempt, current)
+                except Exception:
+                    self.services.logger.exception(
+                        "Chromecast voice: resending the Doubao start shortcut failed")
             if self.provider == "wetype" and self._toggle is not None:
                 outcome = self._wetype_finish_binding.poll(
                     self.capture_watch.identity, current, now)
@@ -1019,9 +1194,13 @@ class VoiceHost:
             self._stop_host()
             self.input_lost.clear()
             return
-        # A late hold-observer callback must not extend the receiver's ready
-        # deadline either. Both WeType modes use this same protocol limit.
-        if self.provider == "wetype" and decision_now - self.start_at >= 9:
+        # A late hold-observer callback must not extend the startup deadline
+        # either. Both WeType modes confirm slow captures within the receiver's
+        # ready deadline; every other provider must confirm quickly because a
+        # stuck "starting" attempt freezes both entry points meanwhile.
+        startup_deadline = (_PROTOCOL_READY_SECONDS if self.provider == "wetype"
+                            else _STARTUP_CONFIRM_SECONDS)
+        if self.provider == "wetype" and decision_now - self.start_at >= startup_deadline:
             confirmed = False
         elif self.provider in {
             "sogou",
@@ -1048,7 +1227,7 @@ class VoiceHost:
             while self.pending_pcm and self.confirmed:
                 self._output(self.pending_pcm.popleft())
             self.pending_samples = 0
-        elif confirmed is False or decision_now - self.start_at >= 9:
+        elif confirmed is False or decision_now - self.start_at >= startup_deadline:
             self.ready_sent = True
             label = {
                 "sogou": "Sogou",

@@ -115,16 +115,24 @@ class DisplayRoundTripTests(unittest.TestCase):
             ),
         )
 
-    def test_old_wheel_actions_display_as_page_keys(self):
-        for old_kind, label in (
-            (key_mapping.ActionKind.MOUSE_WHEEL_UP, "PageUp"),
-            (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, "PageDown"),
+    def test_wheel_actions_display_their_own_labels_and_round_trip(self):
+        for kind, label in (
+            (key_mapping.ActionKind.MOUSE_WHEEL_UP, "鼠标滚轮向上"),
+            (key_mapping.ActionKind.MOUSE_WHEEL_DOWN, "鼠标滚轮向下"),
         ):
-            self.assertEqual(_action_to_display(key_mapping.ButtonAction(old_kind)), label)
-            self.assertEqual(
-                _display_to_action(label),
-                key_mapping.ButtonAction(key_mapping.ActionKind.KEY_COMBO, (label.lower(),)),
+            action = key_mapping.ButtonAction(kind)
+            self.assertEqual(_action_to_display(action), label)
+            self.assertEqual(_display_to_action(label), action)
+
+    def test_page_key_combo_display_spelling_is_stable(self):
+        # Saved .72 page-key combos must keep their persisted display
+        # spellings so old configs stay readable and editable.
+        for combo, label in (("pageup", "PageUp"), ("pagedown", "PageDown")):
+            action = key_mapping.ButtonAction(
+                key_mapping.ActionKind.KEY_COMBO, (combo,)
             )
+            self.assertEqual(_action_to_display(action), label)
+            self.assertEqual(_display_to_action(label), action)
 
     def test_legacy_alt_escape_app_switch_is_displayed_as_reference_action(self):
         action = key_mapping.ButtonAction(
@@ -134,7 +142,7 @@ class DisplayRoundTripTests(unittest.TestCase):
 
     def test_reference_open_app_labels_round_trip_to_semantic_actions(self):
         expected = {
-            "打开无线麦": key_mapping.ActionKind.OPEN_REMOTE_MIC,
+            settings_ui._OPEN_APPLICATION_DISPLAY: key_mapping.ActionKind.OPEN_REMOTE_MIC,
             "打开 Codex": key_mapping.ActionKind.OPEN_CODEX,
             "打开 Claude": key_mapping.ActionKind.OPEN_CLAUDE,
             "打开 cmux 终端": key_mapping.ActionKind.OPEN_CMUX,

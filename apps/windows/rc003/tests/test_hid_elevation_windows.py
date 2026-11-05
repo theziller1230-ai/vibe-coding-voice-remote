@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from ovb_rc003 import hid_elevation_windows
+from ovb_rc003 import product_identity
 
 
 SID = "S-1-5-21-111-222-333-1001"
@@ -1236,7 +1237,7 @@ class InstalledHelperTests(unittest.TestCase):
     def test_versioned_distribution_uses_program_files_directory(self):
         with tempfile.TemporaryDirectory() as raw:
             executable = (
-                Path(raw) / "无线麦 win版 1.0.51-candidate.51.exe"
+                Path(raw) / f"{product_identity.WINDOWS_PRODUCT_NAME} 1.0.51-candidate.51.exe"
             )
             self.assertEqual(
                 hid_elevation_windows.bundled_helper_path(

@@ -729,9 +729,10 @@ class DesktopModeRoutingTests(_ArgvRestoringTestCase):
         self.assertEqual(current_activation_calls, [1])
         self.assertEqual(fallback_activation_calls, [1])
         self.assertEqual(len(notice_calls), 1)
+        from ovb_rc003 import product_identity
         self.assertEqual(
             notice_calls[0],
-            "无线麦已经在启动或运行。\n\n"
+            f"{product_identity.DISPLAY_NAME}已经在启动或运行。\n\n"
             "请从通知区域打开现有程序。",
         )
 
