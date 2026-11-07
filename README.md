@@ -33,6 +33,18 @@
 | 豆包输入法 | [官网下载](https://www.doubao.com/)，建议 1.0.0.23 或更高 |
 | VB-CABLE 虚拟声卡 | [VB-Audio](https://vb-audio.com/Cable/)，免费 |
 
+**买哪只遥控器**：
+
+| 型号 | 参考价 | 录音模式 | 备注 |
+| --- | --- | --- | --- |
+| 谷歌 Chromecast 遥控器（图示款） | 约 15 元 | 按住型 + 开关型 | 可录超过 60 秒，开关型可设自动结束时长 |
+| 小米遥控器 2 Pro | 约 65–99 元 | 仅按住型 | Type-C 充电，单次录音 60 秒内 |
+
+- 图示谷歌款购自某多多平台「金利达数码科技大全」，**仅作型号参考，无利益关联**；
+  同款在其它店铺也常见，认准外形与型号即可。
+- ⚠️ **谷歌遥控器版本很多**：购买前请核对**电池仓内的型号信息**，
+  不能仅凭外观判断是否兼容；外观相近的其它版本不保证能用。
+
 **配对遥控器**：设置 → 蓝牙和其他设备 → 添加设备 → 选择 `Chromecast Remote`
 或 小米遥控器2 Pro（遥控器长按配对键进入配对）。
 
@@ -81,7 +93,33 @@
 
 ---
 
-## 五、常见问题
+## 五、从源码运行 / 自己打包
+
+需要 Python 3.12（x64）。
+
+```bat
+git clone https://github.com/theziller1230-ai/vibe-coding-voice-remote.git
+cd vibe-coding-voice-remote\apps\windows\rc003
+
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+rem 直接以源码运行设置界面（调试用）
+set PYTHONPATH=src
+.venv\Scripts\python.exe -c "from ovb_rc003 import settings_ui; settings_ui.main()"
+
+rem 打包成便携版
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m PyInstaller build\RemoteMicRC003.spec ^
+    --distpath dist --workpath build\pyinstaller-work --noconfirm
+```
+
+产物在 `dist\RemoteMicRC003\`（含 `VCVR 1.0.104.exe` 与 `程序文件\`）。
+运行仍需**管理员权限**。更细的构建说明见 [开发者文档](apps/windows/rc003/README.md)。
+
+---
+
+## 六、常见问题
 
 | 现象 | 处理 |
 | --- | --- |
@@ -97,7 +135,7 @@
 
 ---
 
-## 六、许可与致谢
+## 七、许可与致谢
 
 按 **GPL-3.0-only** 发布，见 [LICENSE.md](LICENSE.md) 与 [COPYRIGHT.md](COPYRIGHT.md)。
 
