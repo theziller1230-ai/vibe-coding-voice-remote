@@ -204,24 +204,20 @@ class ProductIdentityTests(unittest.TestCase):
     def test_qml_reads_the_controller_identity_instead_of_copying_the_name(self):
         qml_dir = _RC003_ROOT / "src" / "ovb_rc003" / "qml"
         main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
-        # The shell binds every identity surface to the presentation layer's
-        # single runtime source (AppViewModel.windowTitle derives from
-        # SettingsController.applicationPresentationLabel - covered by
-        # tests/test_presentation_contract.py).
-        self.assertIn("AppViewModel.windowTitle", main_qml)
-        self.assertIn("title: AppViewModel.windowTitle", main_qml)
-        self.assertIn("tooltip: AppViewModel.windowTitle", main_qml)
-        self.assertIn("AppViewModel.versionLabel", main_qml)
+        self.assertIn("SettingsController.applicationDisplayName", main_qml)
+        self.assertIn("SettingsController.applicationPresentationLabel", main_qml)
 
-        # No view file may copy the identity: not the retired legacy name,
-        # not the current display name, not the version string.
-        for qml_file in sorted(qml_dir.glob("*.qml")):
-            source = qml_file.read_text(encoding="utf-8")
-            self.assertNotIn("Remote Mic", source, qml_file.name)
-            self.assertNotIn(product_identity.DISPLAY_NAME, source, qml_file.name)
-            self.assertNotIn(qt_settings_app.__version__, source, qml_file.name)
+        voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
+        self.assertNotIn("Remote Mic", voice_qml)
 
+        device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
+        self.assertNotIn("Remote Mic", device_qml)
+
+        self.assertIn(
+            "title: SettingsController.applicationPresentationLabel", main_qml
+        )
         self.assertNotIn('title: "%1 · %2"', main_qml)
+        self.assertNotIn(qt_settings_app.__version__, main_qml)
         self.assertNotIn('title: qsTr("%1 设置")', main_qml)
 
     def test_qt_process_identity_uses_the_shared_display_name(self):

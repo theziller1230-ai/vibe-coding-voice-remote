@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 
+from ovb_rc003.hotkey import HotkeySpec
+
 
 _PROBE = r"""
 import json
@@ -98,9 +100,6 @@ class FakeHotkeyCapture:
 m.hotkey_capture_windows.HotkeyCapture = FakeHotkeyCapture
 
 
-voice_program_probe_status = {"code": "not_found", "elevated": None}
-
-
 def inspect_voice_program(settings):
     provider_id = str(settings.get("provider", ""))
     return m.voice_program_manager.VoiceProgramStatus(
@@ -108,11 +107,11 @@ def inspect_voice_program(settings):
         display_name=m.voice_program_manager.VOICE_PROGRAM_PROVIDER_NAMES.get(
             provider_id, "测试语音程序"
         ),
-        available=voice_program_probe_status["code"] != "not_found",
-        running=voice_program_probe_status["code"] == "running",
-        elevated=voice_program_probe_status["elevated"],
+        available=False,
+        running=False,
+        elevated=None,
         executable=None,
-        code=voice_program_probe_status["code"],
+        code="not_found",
     )
 
 
@@ -162,8 +161,6 @@ m.single_instance.bridge_instance_running = lambda: False
 model = ButtonMappingModel()
 controller = SettingsController(model)
 diagnostics = DiagnosticsController(controller, m.config.config_root())
-# Harness safety: probes must never launch or replace a real bridge process.
-controller._start_automatic_bridge_recovery = lambda: None
 qmlRegisterSingletonInstance(
     SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller
 )
@@ -178,8 +175,6 @@ qmlRegisterSingletonInstance(
     "DiagnosticsController",
     diagnostics,
 )
-from ovb_rc003.presentation import registry
-_viewmodels = registry.register(controller=controller, mapping_model=model, diagnostics=diagnostics)
 
 engine = QQmlApplicationEngine()
 qml_dir = m._qml_directory()
@@ -192,209 +187,334 @@ window = engine.rootObjects()[0]
 window.show()
 render(window, app)
 
-page_stack = find(window, "pageStack")
-window.setProperty("width", 900)
-window.setProperty("height", 2400)
-_viewmodels.AppViewModel.currentPage = 2
-find(window, "settingsVoiceSection").setProperty("folded", False)
+tab_bar = find(window, "tabBar")
+tab_bar.setProperty("currentIndex", 2)
 render(window, app)
-
-voice_vm = _viewmodels.VoiceViewModel
-
-pick_button = find(window, "settingsPickCustomProgramButton")
-custom_path_field = pick_button.parent().children()[0]
-start_button = find(window, "settingsStartHotkeyCaptureButton")
-stop_button = find(window, "settingsStopHotkeyCaptureButton")
-hotkey_label = start_button.parent().children()[0]
-
-controls = {
-    name: find(window, name)
-    for name in (
-        "settingsVoiceSection",
-        "settingsPickCustomProgramButton",
-        "settingsLaunchVoiceProgramButton",
-        "settingsOpenVoiceProgramSettingsButton",
-        "settingsStartHotkeyCaptureButton",
-        "settingsStopHotkeyCaptureButton",
-        "settingsTestAudioButton",
-        "settingsInstallVirtualCableButton",
-        "settingsSetRecordingLimitButton",
-    )
-}
-assert all(control is not None for control in controls.values())
-assert custom_path_field is not None
-assert hotkey_label is not None
-
-
-def click(item):
-    point = item.mapToScene(
-        QPointF(item.property("width") / 2, item.property("height") / 2)
-    ).toPoint()
-    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
-    render(window, app)
-
 
 controller.selectedVoiceProgramIndex = 1
 wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
+controller._voice_program_status_code = "not_found"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
+elevated = find(window, "voiceProgramElevatedCheckBox")
+elevated_indicator = elevated.property("indicator")
+image = window.grabWindow()
+screenshot = os.environ.get("VOICE_PROGRAM_SCREENSHOT")
+if screenshot:
+    image.save(screenshot)
 
-managed = {}
-for name, control in list(controls.items()) + [
-    ("customProgramPathField", custom_path_field),
-    ("hotkeyLabel", hotkey_label),
-]:
-    managed[name] = {
-        "visible": bool(control.property("visible")),
-        "enabled": bool(control.property("enabled")),
-        "geometry": geometry(control),
-        "text": str(control.property("text"))
-        if name in ("settingsOpenVoiceProgramSettingsButton", "customProgramPathField",
-                    "hotkeyLabel")
-        else "",
-    }
+controls = {
+    name: find(window, name)
+    for name in (
+        "voiceProgramSection",
+        "voiceProgramSelectionRow",
+        "voiceProgramCombo",
+        "holdVoiceHotkeyField",
+        "voiceHotkeyRow",
+        "voiceProgramElevatedCheckBox",
+        "recordVoiceHotkeyButton",
+        "refreshVoiceHotkeyButton",
+        "openVoiceProgramSettingsButton",
+    )
+}
+assert all(control is not None for control in controls.values())
 
-program_rows = [
-    {
-        "id": str(row.contract.id),
-        "label": str(row.contract.label),
-        "enabled": bool(row.contract.enabled),
-        "selected": bool(row.contract.selected),
-    }
-    for row in voice_vm.voicePrograms
-]
-open_settings_text = str(
-    controls["settingsOpenVoiceProgramSettingsButton"].property("text")
-)
-auto_launch = bool(voice_vm.autoLaunch)
-launch_elevated = bool(voice_vm.launchElevated)
-
+voice_page = find(window, "voiceScroll").parent()
+hotkey_field = controls["holdVoiceHotkeyField"]
+record_button = controls["recordVoiceHotkeyButton"]
+refresh_button = controls["refreshVoiceHotkeyButton"]
+refresh_state = {
+    "visible": bool(refresh_button.property("visible")),
+    "enabled": bool(refresh_button.property("enabled")),
+}
+controller._set_settings_save_busy(True)
+render(window, app)
+refresh_state["saving_enabled"] = bool(refresh_button.property("enabled"))
+controller._set_settings_save_busy(False)
+render(window, app)
+controller._voice_runtime_state = "active"
+controller.voiceRuntimeStatusChanged.emit()
+render(window, app)
+refresh_state["active_enabled"] = bool(refresh_button.property("enabled"))
+controller._voice_runtime_state = "mic_confirmed"
+controller.voiceRuntimeStatusChanged.emit()
+render(window, app)
+refresh_state["mic_confirmed_enabled"] = bool(refresh_button.property("enabled"))
+controller._voice_runtime_state = "receiving_audio"
+controller.voiceRuntimeStatusChanged.emit()
+render(window, app)
+refresh_state["receiving_audio_enabled"] = bool(refresh_button.property("enabled"))
+controller._voice_runtime_state = "finishing"
+controller.voiceRuntimeStatusChanged.emit()
+render(window, app)
+refresh_state["finishing_enabled"] = bool(refresh_button.property("enabled"))
+controller._voice_runtime_state = "not_tested"
+controller.voiceRuntimeStatusChanged.emit()
+render(window, app)
 original_hotkey = str(controller.holdVoiceHotkeyText)
-hotkey_label_before = str(voice_vm.hotkeyLabel)
-click(start_button)
-capture_started = bool(controller.hotkeyCaptureActive)
-click(stop_button)
-capture_flow = {
-    "started": capture_started,
-    "stopped": not bool(controller.hotkeyCaptureActive),
+record_button_center = record_button.mapToScene(
+    QPointF(
+        record_button.property("width") / 2,
+        record_button.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_button_center)
+render(window, app)
+recording_prompt = str(hotkey_field.property("text"))
+outside_target = find(window, "voiceProgramSectionTitle")
+assert outside_target is not None
+outside_center = outside_target.mapToScene(
+    QPointF(
+        outside_target.property("width") / 2,
+        outside_target.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, outside_center)
+render(window, app)
+hotkey_cancel = {
+    "recording_prompt": recording_prompt,
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "field_text": str(hotkey_field.property("text")),
+    "controller_text": str(controller.holdVoiceHotkeyText),
     "original_text": original_hotkey,
-    "field_text": str(controller.holdVoiceHotkeyText),
-    "label_before": hotkey_label_before,
-    "label_after": str(voice_vm.hotkeyLabel),
 }
 
 controller.selectedVoiceProgramIndex = 2
 wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
-wetype_explicit_reads = provider_read_requests.count(("wetype", True))
-voice_program_probe_status.update(code="stopped", elevated=None)
-controller._refresh_voice_program_status()
+assert ("wetype", True) not in provider_read_requests
+controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
-wetype_program_installed = str(voice_vm.voiceCard.contract.detail)
-voice_program_probe_status.update(code="running", elevated=None)
-controller._refresh_voice_program_status()
+refresh_center = refresh_button.mapToScene(
+    QPointF(refresh_button.property("width") / 2, refresh_button.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, refresh_center)
+wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
-wetype_program_running = str(voice_vm.voiceCard.contract.detail)
-voice_program_probe_status.update(code="not_found", elevated=None)
-controller._refresh_voice_program_status()
+wetype_refresh = {
+    "text": str(controller.holdVoiceHotkeyText),
+    "source": str(controller.voiceHotkeySource),
+    "explicit_reads": provider_read_requests.count(("wetype", True)),
+    "error": str(controller.errorMessage),
+}
+wetype_before = str(controller.holdVoiceHotkeyText)
+record_button_center = record_button.mapToScene(
+    QPointF(record_button.property("width") / 2, record_button.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_button_center)
+render(window, app)
+wetype_hotkey = {
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "enabled": bool(hotkey_field.property("enabled")),
+    "field_text": str(hotkey_field.property("text")),
+    "controller_text": str(controller.holdVoiceHotkeyText),
+    "original_text": wetype_before,
+    "description": str(controls["voiceHotkeyRow"].property("descriptionText")),
+    "state": str(controls["voiceHotkeyRow"].property("stateText")),
+}
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_button_center)
+render(window, app)
+
+controller._voice_program_status_code = "stopped"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
+wetype_program_installed = str(
+    controls["voiceProgramSelectionRow"].property("stateText")
+)
+controller._voice_program_status_code = "running"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
+wetype_program_running = str(
+    controls["voiceProgramSelectionRow"].property("stateText")
+)
 
 controller.selectedVoiceProgramIndex = 5
 wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
-chatterfly_hotkey_label = str(voice_vm.hotkeyLabel)
+chatterfly = {
+    "shortcut": str(hotkey_field.property("text")),
+    "refresh_visible": bool(refresh_button.property("visible")),
+    "refresh_enabled": bool(refresh_button.property("enabled")),
+    "state": str(controls["voiceHotkeyRow"].property("stateText")),
+}
+voice_page.setProperty("voiceHotkeyRecording", True)
+render(window, app)
+chatterfly["recording_refresh_enabled"] = bool(refresh_button.property("enabled"))
+voice_page.setProperty("voiceHotkeyRecording", False)
 
-controller._replace_voice_program_settings(
-    dict(controller._voice_program_settings, provider="custom")
-)
+controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
 wait_for_voice_hotkey_idle(controller, app)
 render(window, app)
-custom_exe = m.config.config_root() / "voice-tool.exe"
-custom_exe.parent.mkdir(parents=True, exist_ok=True)
-custom_exe.touch()
-picked = voice_vm.pickCustomProgramPath(QUrl.fromLocalFile(str(custom_exe)).toString())
-custom_path = {
-    "ok": bool(picked.ok),
-    "expected": str(custom_exe),
-    "path": str(picked.message),
-    "view_path": str(voice_vm.customProgramPath),
-    "field_text": str(custom_path_field.property("text")),
+custom_record_button_center = record_button.mapToScene(
+    QPointF(
+        record_button.property("width") / 2,
+        record_button.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, custom_record_button_center)
+render(window, app)
+QTest.keyPress(window, Qt.Key_Control, Qt.ControlModifier)
+QTest.keyPress(window, Qt.Key_Shift, Qt.ControlModifier | Qt.ShiftModifier)
+QTest.keyPress(window, Qt.Key_F9, Qt.ControlModifier | Qt.ShiftModifier)
+QTest.keyRelease(window, Qt.Key_F9, Qt.ControlModifier | Qt.ShiftModifier)
+QTest.keyRelease(window, Qt.Key_Shift, Qt.ControlModifier)
+QTest.keyRelease(window, Qt.Key_Control, Qt.NoModifier)
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+qt_fallback_hotkey = {
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "field_text": str(hotkey_field.property("text")),
+    "controller_text": str(controller.holdVoiceHotkeyText),
 }
 
-provider_states = {}
-for provider_id, index in (("sogou", 1), ("wetype", 2), ("doubao_ime", 3), ("chatterfly", 5)):
-    controller.selectedVoiceProgramIndex = index
-    wait_for_voice_hotkey_idle(controller, app)
-    render(window, app)
-    provider_states[provider_id] = {
-        "controls_visible": all(
-            bool(control.property("visible")) for control in controls.values()
-        ),
-        "controls_enabled": all(
-            bool(control.property("enabled")) for control in controls.values()
-        ),
-        "auto_launch": bool(voice_vm.autoLaunch),
-        "launch_elevated": bool(voice_vm.launchElevated),
-        "custom_program_path": str(voice_vm.customProgramPath),
-    }
+controller.selectedVoiceProgramIndex = 1
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+controller._voice_program_status_code = "not_found"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
+current_hotkey = str(controller.holdVoiceHotkeyText)
 
+elevated = controls["voiceProgramElevatedCheckBox"]
+elevated_before = bool(controller.voiceProgramLaunchElevated)
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_button_center)
+render(window, app)
+elevated_center = elevated.mapToScene(
+    QPointF(
+        elevated.property("width") / 2,
+        elevated.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, elevated_center)
+render(window, app)
+hotkey_other_action = {
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "action_completed": bool(controller.voiceProgramLaunchElevated)
+    != elevated_before,
+    "field_text": str(hotkey_field.property("text")),
+    "original_text": current_hotkey,
+}
+controller.voiceProgramLaunchElevated = elevated_before
+controller._voice_program_status_code = "not_found"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
+
+voice_page.setProperty("voiceHotkeyRecording", True)
 controller.hotkeyCaptureError.emit("模拟启动失败")
 render(window, app)
 inactive_capture_error = {
-    "message": str(voice_vm.lastValidation.contract.message),
-    "ok": bool(voice_vm.lastValidation.contract.ok),
-    "field": str(voice_vm.lastValidation.contract.field),
-    "facet": str(find(window, "homeFacetDictation").property("valueText")),
-    "capture_active": bool(controller.hotkeyCaptureActive),
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "description": str(controls["voiceHotkeyRow"].property("descriptionText")),
 }
+voice_page.setProperty("voiceHotkeyCaptureError", "")
 
 retained_capture = FakeHotkeyCapture(lambda _chord: None)
 retained_capture.is_running = True
 controller._hotkey_capture = retained_capture
 controller._set_input_operation_state("hotkey", "active")
+voice_page.setProperty("voiceHotkeyRecording", True)
 controller.hotkeyCaptureError.emit("模拟停止前异常")
 render(window, app)
 active_capture_error = {
-    "message": str(voice_vm.lastValidation.contract.message),
-    "facet": str(find(window, "homeFacetDictation").property("valueText")),
-    "capture_retained": bool(controller.hotkeyCaptureActive),
+    "recording": bool(voice_page.property("voiceHotkeyRecording")),
+    "description": str(controls["voiceHotkeyRow"].property("descriptionText")),
 }
 controller.stopHotkeyCapture()
 render(window, app)
+voice_page.setProperty("voiceHotkeyCaptureError", "")
 
-click(start_button)
-elevated_before = bool(voice_vm.launchElevated)
-other_verdict = voice_vm.setLaunchElevated(not elevated_before)
-hotkey_other_action = {
-    "action_completed": bool(voice_vm.launchElevated) != elevated_before,
-    "validation_ok": bool(other_verdict.ok),
+managed = {
+    name: {
+        "visible": bool(control.property("visible")),
+        "enabled": bool(control.property("enabled")),
+        "geometry": geometry(control),
+        "text": str(control.property("text"))
+        if name == "openVoiceProgramSettingsButton" else "",
+    }
+    for name, control in controls.items()
 }
-voice_vm.setLaunchElevated(elevated_before)
-controller.stopHotkeyCapture()
-render(window, app)
+managed_auto_start = bool(controller.voiceProgramLaunchOnBridgeStart)
+managed_elevated = bool(controller.voiceProgramLaunchElevated)
+managed_hotkey_state = str(controls["voiceHotkeyRow"].property("stateText"))
 
-screenshot = os.environ.get("VOICE_PROGRAM_SCREENSHOT")
-if screenshot:
-    window.grabWindow().save(screenshot)
+controller.selectedVoiceProgramIndex = 2
+render(window, app)
+system_managed = {
+    "provider": bool(controller.voiceProgramSystemManaged),
+    "auto_start": bool(controller.voiceProgramLaunchOnBridgeStart),
+    "elevated_visible": bool(elevated.property("visible")),
+    "custom_path_visible": bool(
+        find(window, "voiceProgramCustomPathField").property("visible")
+    ),
+    "settings_visible": bool(
+        find(window, "openVoiceProgramSettingsButton").property("visible")
+    ),
+}
+
+controller.selectedVoiceProgramIndex = 3
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+doubao = {
+    "provider": bool(controller.voiceProgramSystemManaged),
+    "launchable": bool(controller.voiceProgramLaunchable),
+    "auto_start": bool(controller.voiceProgramLaunchOnBridgeStart),
+    "elevated_visible": bool(elevated.property("visible")),
+    "settings_visible": bool(
+        find(window, "openVoiceProgramSettingsButton").property("visible")
+    ),
+    "refresh_visible": bool(
+        find(window, "refreshVoiceHotkeyButton").property("visible")
+    ),
+    "description": str(controls["voiceHotkeyRow"].property("descriptionText")),
+}
+
+controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+custom_program = {
+    "path_visible": bool(
+        find(window, "voiceProgramCustomPathField").property("visible")
+    ),
+    "elevated_visible": bool(elevated.property("visible")),
+    "settings_visible": bool(
+        find(window, "openVoiceProgramSettingsButton").property("visible")
+    ),
+}
+
+# Load a legacy unconfigured document; index zero can no longer be selected.
+controller._replace_voice_program_settings({"provider": "none"})
+render(window, app)
+unmanaged_elevated = {
+    "visible": bool(elevated.property("visible")),
+    "enabled": bool(elevated.property("enabled")),
+}
 
 result = {
     "warnings": [value.toString() for value in warnings],
-    "root_objects": len(engine.rootObjects()),
     "window_width": float(window.property("width")),
     "window_height": float(window.property("height")),
     "managed": managed,
-    "open_settings_text": open_settings_text,
-    "program_rows": program_rows,
-    "auto_launch": auto_launch,
-    "launch_elevated": launch_elevated,
-    "capture_flow": capture_flow,
-    "wetype_explicit_reads": wetype_explicit_reads,
+    "elevated_indicator": geometry(elevated_indicator),
+    "managed_auto_start": managed_auto_start,
+    "managed_elevated": managed_elevated,
+    "managed_hotkey_state": managed_hotkey_state,
+    "refresh_state": refresh_state,
+    "hotkey_cancel": hotkey_cancel,
+    "wetype_hotkey": wetype_hotkey,
+    "wetype_refresh": wetype_refresh,
     "wetype_program_installed": wetype_program_installed,
     "wetype_program_running": wetype_program_running,
-    "chatterfly_hotkey_label": chatterfly_hotkey_label,
-    "custom_path": custom_path,
-    "provider_states": provider_states,
+    "qt_fallback_hotkey": qt_fallback_hotkey,
+    "hotkey_other_action": hotkey_other_action,
     "inactive_capture_error": inactive_capture_error,
     "active_capture_error": active_capture_error,
-    "hotkey_other_action": hotkey_other_action,
+    "system_managed": system_managed,
+    "doubao": doubao,
+    "chatterfly": chatterfly,
+    "custom_program": custom_program,
+    "unmanaged_elevated": unmanaged_elevated,
     "retired_controls_absent": all(
         find(window, name) is None
         for name in (
@@ -408,16 +528,6 @@ result = {
             "voiceProgramLaunchText",
             "voiceProgramStatusRefreshTimer",
             "useWindowsDictationHotkeyButton",
-            "voiceProgramCombo",
-            "voiceProgramSelectionRow",
-            "voiceHotkeyRow",
-            "holdVoiceHotkeyField",
-            "recordVoiceHotkeyButton",
-            "refreshVoiceHotkeyButton",
-            "voiceProgramElevatedCheckBox",
-            "openVoiceProgramSettingsButton",
-            "voiceProgramCustomPathField",
-            "voiceScroll",
         )
     ),
 }
@@ -430,15 +540,17 @@ print(json.dumps(result, ensure_ascii=False))
 class VoiceProgramQmlTests(unittest.TestCase):
     def test_running_sogou_is_shown_as_running_without_a_voice_window(self):
         probe = _PROBE.replace(
-            "controller.shutdownBackgroundTasks()",
-            '''voice_program_probe_status.update(code="running", elevated=None)
-controller._replace_voice_program_settings(
+            'controller.shutdownBackgroundTasks()',
+            '''controller._voice_program_settings = (
     m.voice_program_manager.normalize_voice_program_settings({"provider": "sogou"})
 )
-controller._refresh_voice_program_status()
+controller.selectedVoiceProgramIndexChanged.emit()
+controller._voice_program_status_code = "running"
+controller.voiceProgramStatusCodeChanged.emit()
 render(window, app)
-result["root_objects"] = len(engine.rootObjects())
-result["sogou_running_state"] = str(voice_vm.voiceCard.contract.detail)
+result["sogou_running_state"] = str(
+    controls["voiceProgramSelectionRow"].property("stateText")
+)
 controller.shutdownBackgroundTasks()''',
         )
         env = dict(os.environ)
@@ -459,8 +571,7 @@ controller.shutdownBackgroundTasks()''',
             f"voice-program QML probe failed: {result.stdout}\n{result.stderr}",
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(data["root_objects"], 1)
-        self.assertEqual(data["sogou_running_state"], "正在运行（权限状态未知）。")
+        self.assertEqual(data["sogou_running_state"], "运行中")
 
     def test_voice_page_owns_the_provider_specific_voice_program_controls(self):
         env = dict(os.environ)
@@ -482,96 +593,126 @@ controller.shutdownBackgroundTasks()''',
         )
         data = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(data["warnings"], [])
-        self.assertEqual(data["root_objects"], 1)
+        self.assertEqual(data["chatterfly"], {
+            "shortcut": "右 Ctrl + 右 Shift + 0",
+            "refresh_visible": True, "refresh_enabled": True,
+            "state": "自动识别", "recording_refresh_enabled": False,
+        })
         self.assertTrue(data["retired_controls_absent"])
-
-        # The voice surface owns the provider selection rows and every
-        # provider-specific voice-program control.
-        self.assertEqual(len(data["program_rows"]), 5)
-        self.assertEqual(
-            [row["id"] for row in data["program_rows"]], ["0", "1", "2", "3", "4"]
-        )
-        self.assertTrue(all(row["enabled"] for row in data["program_rows"]))
-        self.assertEqual(
-            [row["selected"] for row in data["program_rows"]],
-            [False, True, False, False, False],
-        )
         self.assertTrue(all(item["visible"] for item in data["managed"].values()))
         self.assertTrue(all(item["enabled"] for item in data["managed"].values()))
         self.assertEqual(
-            data["managed"]["settingsOpenVoiceProgramSettingsButton"]["text"],
-            "打开语音程序设置",
+            data["managed"]["openVoiceProgramSettingsButton"]["text"],
+            "去安装",
         )
-        self.assertTrue(data["auto_launch"])
-        self.assertTrue(data["launch_elevated"])
-
-        # Provider hotkey read-back reflects onto the presentation label and
-        # never opens the provider settings window implicitly.
-        self.assertEqual(data["chatterfly_hotkey_label"], "右 Ctrl + 右 Shift + 0")
-        self.assertEqual(data["wetype_explicit_reads"], 0)
-        self.assertEqual(
-            data["wetype_program_installed"],
-            "已找到微信输入法；由 Windows 管理，当前未检测到后台进程。",
+        self.assertTrue(
+            data["managed"]["openVoiceProgramSettingsButton"]["visible"]
         )
+        self.assertTrue(data["managed_auto_start"])
+        self.assertTrue(data["managed_elevated"])
+        self.assertTrue(data["refresh_state"]["visible"])
+        self.assertTrue(data["refresh_state"]["enabled"])
+        self.assertEqual(data["managed_hotkey_state"], "自动识别")
+        self.assertFalse(data["refresh_state"]["saving_enabled"])
+        self.assertFalse(data["refresh_state"]["active_enabled"])
+        self.assertFalse(data["refresh_state"]["mic_confirmed_enabled"])
+        self.assertFalse(data["refresh_state"]["receiving_audio_enabled"])
+        self.assertFalse(data["refresh_state"]["finishing_enabled"])
+        self.assertEqual(data["hotkey_cancel"]["recording_prompt"], "请按快捷键")
+        self.assertFalse(data["hotkey_cancel"]["recording"])
         self.assertEqual(
-            data["wetype_program_running"],
-            "微信输入法已安装并正在运行（由 Windows 管理）。",
-        )
-
-        # Hotkey capture is owned by the 录入/停止 pair; cancelling preserves
-        # the configured shortcut exactly.
-        self.assertTrue(data["capture_flow"]["started"])
-        self.assertTrue(data["capture_flow"]["stopped"])
-        self.assertEqual(
-            data["capture_flow"]["field_text"], data["capture_flow"]["original_text"]
+            HotkeySpec.from_user_text(data["hotkey_cancel"]["field_text"]).serialize(),
+            data["hotkey_cancel"]["original_text"],
         )
         self.assertEqual(
-            data["capture_flow"]["label_after"], data["capture_flow"]["label_before"]
+            data["hotkey_cancel"]["controller_text"],
+            data["hotkey_cancel"]["original_text"],
         )
-
-        # Custom program path: the typed pick slot stores the chosen file and
-        # both the view-model and the path field reflect it.
-        self.assertTrue(data["custom_path"]["ok"])
+        self.assertTrue(data["wetype_hotkey"]["recording"])
+        self.assertTrue(data["wetype_hotkey"]["enabled"])
+        self.assertEqual(data["wetype_hotkey"]["field_text"], "请按快捷键")
         self.assertEqual(
-            os.path.normcase(os.path.normpath(data["custom_path"]["path"])),
-            os.path.normcase(os.path.normpath(data["custom_path"]["expected"])),
+            data["wetype_hotkey"]["controller_text"],
+            data["wetype_hotkey"]["original_text"],
         )
-        self.assertTrue(data["custom_path"]["path"].endswith("voice-tool.exe"))
-        self.assertEqual(data["custom_path"]["view_path"], data["custom_path"]["path"])
-        self.assertEqual(data["custom_path"]["field_text"], data["custom_path"]["path"])
-
-        # The provider-specific controls stay available and operable across
-        # every provider state.
-        for provider, state in data["provider_states"].items():
-            self.assertTrue(state["controls_visible"], provider)
-            self.assertTrue(state["controls_enabled"], provider)
-        self.assertTrue(data["provider_states"]["sogou"]["auto_launch"])
-
-        # Capture errors surface to the user; a capture error while the capture
-        # is still owned does not tear the capture down.
-        inactive = data["inactive_capture_error"]
-        self.assertEqual(inactive["message"], "模拟启动失败")
-        self.assertFalse(inactive["ok"])
-        self.assertEqual(inactive["field"], "hotkey")
-        self.assertEqual(inactive["facet"], "模拟启动失败")
-        self.assertFalse(inactive["capture_active"])
-        active = data["active_capture_error"]
-        self.assertEqual(active["message"], "模拟停止前异常")
-        self.assertEqual(active["facet"], "模拟停止前异常")
-        self.assertTrue(active["capture_retained"])
-
-        # An in-progress capture must not block other voice-program actions.
+        self.assertEqual(
+            data["wetype_hotkey"]["description"],
+            "刷新时会打开微信设置",
+        )
+        self.assertEqual(data["wetype_refresh"], {
+            "text": "lctrl+lwin", "source": "auto", "explicit_reads": 1, "error": "",
+        })
+        self.assertEqual(data["wetype_hotkey"]["state"], "录入中")
+        self.assertEqual(data["wetype_program_installed"], "已安装")
+        self.assertEqual(data["wetype_program_running"], "运行中")
+        self.assertFalse(data["qt_fallback_hotkey"]["recording"])
+        self.assertEqual(
+            HotkeySpec.from_user_text(data["qt_fallback_hotkey"]["field_text"]).serialize(),
+            "ctrl+shift+f9",
+        )
+        self.assertEqual(
+            data["qt_fallback_hotkey"]["controller_text"],
+            "ctrl+shift+f9",
+        )
+        self.assertFalse(data["hotkey_other_action"]["recording"])
         self.assertTrue(data["hotkey_other_action"]["action_completed"])
-        self.assertTrue(data["hotkey_other_action"]["validation_ok"])
-
-        # Layout: the hotkey row keeps its controls side by side without
-        # overlap, and every control stays inside the window.
-        hotkey_label = data["managed"]["hotkeyLabel"]["geometry"]
-        start_button = data["managed"]["settingsStartHotkeyCaptureButton"]["geometry"]
-        stop_button = data["managed"]["settingsStopHotkeyCaptureButton"]["geometry"]
-        self.assertLessEqual(hotkey_label["right"], start_button["x"] + 1)
-        self.assertLessEqual(start_button["right"], stop_button["x"] + 1)
-        self.assertGreaterEqual(start_button["x"], hotkey_label["x"])
+        self.assertEqual(
+            HotkeySpec.from_user_text(data["hotkey_other_action"]["field_text"]).serialize(),
+            data["hotkey_other_action"]["original_text"],
+        )
+        self.assertFalse(data["inactive_capture_error"]["recording"])
+        self.assertEqual(
+            data["inactive_capture_error"]["description"],
+            "模拟启动失败",
+        )
+        self.assertTrue(data["active_capture_error"]["recording"])
+        self.assertEqual(
+            data["active_capture_error"]["description"],
+            "模拟停止前异常",
+        )
+        self.assertEqual(data["elevated_indicator"]["width"], 16)
+        self.assertEqual(data["elevated_indicator"]["height"], 16)
+        self.assertAlmostEqual(
+            data["managed"]["voiceProgramCombo"]["geometry"]["y"],
+            data["managed"]["voiceProgramElevatedCheckBox"]["geometry"]["y"],
+            delta=1,
+        )
+        self.assertTrue(data["system_managed"]["provider"])
+        self.assertFalse(data["system_managed"]["auto_start"])
+        self.assertFalse(data["system_managed"]["elevated_visible"])
+        self.assertFalse(data["system_managed"]["custom_path_visible"])
+        self.assertTrue(data["system_managed"]["settings_visible"])
+        self.assertFalse(data["doubao"]["provider"])
+        self.assertFalse(data["doubao"]["launchable"])
+        self.assertFalse(data["doubao"]["auto_start"])
+        self.assertFalse(data["doubao"]["elevated_visible"])
+        self.assertTrue(data["doubao"]["settings_visible"])
+        self.assertTrue(data["doubao"]["refresh_visible"])
+        self.assertEqual(
+            data["doubao"]["description"],
+            "自动读取按住型快捷键",
+        )
+        self.assertTrue(data["custom_program"]["path_visible"])
+        self.assertTrue(data["custom_program"]["elevated_visible"])
+        self.assertFalse(data["custom_program"]["settings_visible"])
+        self.assertFalse(data["unmanaged_elevated"]["visible"])
+        self.assertFalse(data["unmanaged_elevated"]["enabled"])
+        self.assertLessEqual(
+            data["managed"]["holdVoiceHotkeyField"]["geometry"]["right"],
+            data["managed"]["recordVoiceHotkeyButton"]["geometry"]["x"] + 1,
+        )
+        self.assertGreaterEqual(
+            data["managed"]["refreshVoiceHotkeyButton"]["geometry"]["x"],
+            data["managed"]["holdVoiceHotkeyField"]["geometry"]["x"],
+        )
+        self.assertLessEqual(
+            data["managed"]["refreshVoiceHotkeyButton"]["geometry"]["right"],
+            data["managed"]["holdVoiceHotkeyField"]["geometry"]["right"] + 1,
+        )
+        self.assertEqual(
+            data["managed"]["refreshVoiceHotkeyButton"]["geometry"]["width"],
+            28,
+        )
         for item in data["managed"].values():
             bounds = item["geometry"]
             self.assertGreater(bounds["width"], 0)

@@ -1083,11 +1083,6 @@ diagnostics = classes['DiagnosticsController'](controller, m.config.config_root(
 diagnostics.refreshDiagnostics = lambda: None
 for name, instance in [('SettingsController', controller), ('ButtonMappingModel', model), ('DiagnosticsController', diagnostics)]:
     classes['qmlRegisterSingletonInstance'](classes[name], 'OvbRc003Settings', 1, 0, name, instance)
-# The new QML binds only to the presentation singletons; keep the returned
-# set referenced for the engine's lifetime (qmlRegisterSingletonInstance does
-# not own the registered instances).
-from ovb_rc003.presentation import registry
-_viewmodels = registry.register(controller=controller, mapping_model=model, diagnostics=diagnostics)
 engine = classes['QQmlApplicationEngine']()
 warnings = []
 engine.warnings.connect(lambda messages: warnings.extend(str(message) for message in messages))
@@ -1127,109 +1122,97 @@ def click(name):
     assert QMetaObject.invokeMethod(button, 'clicked'), name
     app.processEvents()
 
-def walk(root):
-    ordered, visited = [], set()
-    def visit(node):
-        if node in visited:
-            return
-        visited.add(node)
-        ordered.append(node)
-        kids = list(node.children())
-        child_items = getattr(node, 'childItems', None)
-        if child_items:
-            kids.extend(kid for kid in child_items() if kid not in kids)
-        for kid in kids:
-            visit(kid)
-    visit(root)
-    return ordered
-def find_all(root, predicate):
-    return [node for node in walk(root) if predicate(node)]
-def class_name(node):
-    return node.metaObject().className()
-def settle(frames=12):
-    for _ in range(frames):
+def popup_labels(name):
+    combo = item(name)
+    engine.globalObject().setProperty('probeCombo', engine.newQObject(combo))
+    assert not engine.evaluate('probeCombo.popup.open()').isError()
+    for _ in range(12):
         app.processEvents()
         window.grabWindow()
-def nav(name):
-    assert QMetaObject.invokeMethod(item(name), 'pressed'), name
-    settle()
+    result = engine.evaluate("""(function() {
+        const labels = [];
+        for (let i = 0; i < probeCombo.count; i++) {
+            const row = probeCombo.popup.contentItem.itemAtIndex(i);
+            if (row && row.contentItem.textFormat !== 0) throw new Error('device label must be plain text');
+            labels.push(row ? row.contentItem.text : null);
+        }
+        return labels;
+    })()""")
+    assert not result.isError(), result.toString()
+    labels = result.toVariant()
+    screenshot_dir = os.environ.get('REMOTE_SELECTION_SCREENSHOT_DIR')
+    if screenshot_dir and name == 'remoteDeviceCombo':
+        assert window.grabWindow().save(str(Path(screenshot_dir) / 'paired-device-options.png'))
+    assert not engine.evaluate('probeCombo.popup.close()').isError()
+    app.processEvents()
+    return labels
 
-# == shared journey marker ==
+click('selectRemoteButton')
 from PySide6.QtTest import QTest
-from PySide6.QtCore import Qt
-device_vm = _viewmodels.DeviceViewModel
-voice_vm = _viewmodels.VoiceViewModel
-app_vm = _viewmodels.AppViewModel
-mapping_vm = _viewmodels.MappingViewModel
-nav('settingsTabButton')
-click('settingsDeviceSection_foldToggle')
-settle()
-device_section = item('settingsDeviceSection')
-click('settingsRefreshChecksButton')
-settle()
-
-def choice_rows():
-    return [(row.id, row.label, row.enabled, row.selected) for row in device_vm.remoteChoices]
-
-def state_marks():
-    return find_all(device_section, lambda node: class_name(node).startswith('UiLabel')
-                    and node.property('text') == '当前使用')
-
-def inline_rows():
-    return find_all(device_section, lambda node: node.metaObject().indexOfProperty('editorColumnWidth') >= 0
-                    and node.metaObject().indexOfProperty('stateText') >= 0)
-
-assert not controller.activeRemoteKey
-assert not controller._remote_selection()['devices']
-assert choice_rows() == [(A, selection.label(A), True, False),
-                         (B, label_b, True, False)], choice_rows()
+for _ in range(50):
+    app.processEvents()
+    if item('remoteDeviceCombo').property('count') == 2 and not controller.remoteDevicesRefreshing:
+        break
+    QTest.qWait(10)
+assert item('remoteDeviceDialog').property('visible')
 assert controller.remoteSelectionMessage == ''
+assert not item('remoteSelectionMessage').property('visible')
+assert item('remoteDeviceHelpNote').property('lineCount') == 1
+assert item('remoteDeviceHelpNote').property('text') == '切换会结束录音，各设备设置分别保留。'
+assert not controller.activeRemoteKey
+assert not item('useRemoteButton').property('enabled')
+assert '请选择' in item('remoteDeviceCombo').property('displayText')
+available_labels = popup_labels('remoteDeviceCombo')
+assert available_labels == [selection.label(A), label_b], available_labels
 assert window.findChild(QObject, 'addRemoteButton') is None
 assert window.findChild(QObject, 'removeRemoteButton') is None
-# The device chooser is a set of compact rows (InlineSettingsRow, 42px high)
-# with medium-weight plain-text titles; only paired devices are offered.
-rows = inline_rows()
-assert len(rows) == 2, [class_name(node) for node in rows]
-assert all(row.property('height') == 42 for row in rows), [row.property('height') for row in rows]
-for label in (selection.label(A), label_b):
-    titles = find_all(device_section, lambda node, label=label: class_name(node).startswith('UiLabel')
-                      and node.property('text') == label)
-    assert titles, label
-    assert all(node.property('font').weight() == 500 for node in titles), label
-assert state_marks() == []
-assert all('<' not in row[1] for row in choice_rows())
-# Using a remote is explicit: nothing activates before useRemote(id).
-device_vm.useRemote(A)
-settle()
+assert engine.evaluate('probeCombo.contentItem.textFormat').toInt() == 0
+
+def choose(key):
+    combo = item('remoteDeviceCombo')
+    index = next(i for i, row in enumerate(controller.remoteDeviceChoices) if row['key'] == key)
+    engine.globalObject().setProperty('probeChoice', engine.newQObject(combo))
+    result = engine.evaluate('probeChoice.currentIndex = %d; probeChoice.activated(%d)' % (index, index))
+    assert not result.isError(), result.toString()
+    app.processEvents()
+
+choose(A)
+assert not controller.activeRemoteKey and not controller._remote_selection()['devices']
+click('useRemoteButton')
 assert controller.activeRemoteKey == A
-assert choice_rows() == [(A, selection.label(A), True, True),
-                         (B, label_b, True, False)], choice_rows()
-assert len(state_marks()) == 1
-# Reordering the enumeration never moves the selection: it is keyed by id.
+choose(B)
+assert controller.activeRemoteKey == A
+assert popup_labels('remoteDeviceCombo') == [selection.label(A), label_b]
+weights = engine.evaluate('[0, 1].map(i => probeCombo.popup.contentItem.itemAtIndex(i).contentItem.font.weight)').toVariant()
+assert weights[0] > weights[1], weights
+assert item('remoteDeviceCombo_effectiveMark_0').property('glyph') == '\uE73E'
+# Browsing B does not move A's effective (bold/check) marker. Refresh preserves
+# the draft by identity even if the operating system changes enumeration order.
+assert item('remoteDeviceCombo').property('effectiveIndex') == 0
 controller._on_remote_devices_ready(([paired_rows[1], paired_rows[0], paired_rows[2]], ''))
-settle()
-assert choice_rows() == [(B, label_b, True, False),
-                         (A, selection.label(A), True, True)], choice_rows()
-assert controller.activeRemoteKey == A
-# A failed read marks every choice pending and disabled; it is not proof that
-# paired devices vanished.
+app.processEvents()
+assert item('remoteDeviceCombo').property('currentIndex') == 0
+assert item('remoteDeviceCombo').property('effectiveIndex') == 1
+assert item('remoteDeviceDialog').property('pendingRemoteKey') == B
 controller._on_remote_devices_ready((None, '读取失败'))
-settle()
-rows = choice_rows()
-assert [row[2] for row in rows] == [False, False], rows
-assert [row[3] for row in rows] == [False, True], rows
-assert [row[1] for row in rows] == [label_b + '（待重新读取）',
-                                    selection.label(A) + '（待重新读取）'], rows
+app.processEvents()
 assert controller.activeRemoteKey == A
-# A genuinely removed device disappears from the choices; the active stays.
+assert item('remoteDeviceDialog').property('pendingRemoteKey') == B
+assert not item('useRemoteButton').property('enabled')
 controller._on_remote_devices_ready(([paired_rows[0]], ''))
-settle()
-assert choice_rows() == [(A, selection.label(A), True, True)], choice_rows()
-assert controller.activeRemoteKey == A
+app.processEvents()
+assert item('remoteDeviceCombo').property('currentIndex') == -1
+assert not item('useRemoteButton').property('enabled')
 controller._on_remote_devices_ready((paired_rows, ''))
-settle()
-assert choice_rows() == [(A, selection.label(A), True, True),
-                         (B, label_b, True, False)], choice_rows()
+app.processEvents()
+assert item('remoteDeviceDialog').property('pendingRemoteKey') == B
+click('closeRemoteDialogButton')
+assert controller.activeRemoteKey == A
+click('selectRemoteButton')
+for _ in range(20):
+    app.processEvents()
+    QTest.qWait(5)
+assert item('remoteDeviceDialog').property('pendingRemoteKey') == A
 hotkey_scenario = bool(os.environ.get('REMOTE_SELECTION_HOTKEY_SCENARIO'))
 hotkey_reads = []
 if hotkey_scenario:
@@ -1247,8 +1230,8 @@ if hotkey_scenario:
         hotkey_reads.append(provider)
         return m.voice_hotkey_sync_windows.VoiceHotkeySyncResult(provider, True, 'read', 'rshift+i', '已读取')
     m.voice_hotkey_sync_windows.read_provider_hotkey = read_current
-device_vm.useRemote(B)
-settle()
+choose(B)
+click('useRemoteButton')
 assert controller.activeRemoteKey == B
 assert controller.activeRemoteProfile == profile_b
 if hotkey_scenario:
@@ -1260,109 +1243,113 @@ if hotkey_scenario:
     assert controller.voiceHotkeySource == 'auto'
     assert hotkey_reads == ['chatterfly'], hotkey_reads
     assert m.config.voice_hotkey_for_provider(m.config.load_config(path), 'chatterfly') == 'rshift+i'
-    # The updated shortcut shows on the voice surface without a refresh.
-    assert voice_vm.hotkeyLabel == controller.formatHotkeyText('rshift+i'), voice_vm.hotkeyLabel
-assert choice_rows() == [(A, selection.label(A), True, False),
-                         (B, label_b, True, True)], choice_rows()
 if profile_b == 'xiaomi-rc003':
-    nav('mappingTabButton')
-    assert model.rowCount() == 13
-    assert 'RC003-remote-photo.png' in controller.photoSource
-    keys_panel = item('keysPanel')
-    deadline = time.monotonic() + 3
-    while 'RC003-remote-photo.png' not in keys_panel.property('photoSourceUrl') and time.monotonic() < deadline:
+    click('closeRemoteDialogButton')
+    assert QMetaObject.invokeMethod(item('mappingTabButton'), 'pressed')
+    for _ in range(12):
         app.processEvents()
         window.grabWindow()
-    assert 'RC003-remote-photo.png' in keys_panel.property('photoSourceUrl'), keys_panel.property('photoSourceUrl')
+    assert model.rowCount() == 13
+    assert 'RC003-remote-photo.png' in controller.photoSource
+    assert item('rc003DeviceButton').property('highlighted')
+    assert not item('futureDeviceButton').property('highlighted')
+    assert item('editMapping_menu').property('enabled')
+    assert item('editMapping_tv').property('enabled')
     assert item('photoSidebar').property('width') == 114
     assert item('photoImage').property('height') == 270
     assert item('mappingLines').property('z') == 0
-    assert item('editMapping_menu').property('enabled')
-    assert item('editMapping_tv').property('enabled')
-    assert item('editMapping_mic').property('voiceAction')
-    assert item('mappingVoicePausedText_mic').property('text') == '语音模式下暂停'
     if os.environ.get('REMOTE_SELECTION_SCREENSHOT_DIR'):
         assert window.grabWindow().save(str(Path(os.environ['REMOTE_SELECTION_SCREENSHOT_DIR']) / 'xiaomi-buttons.png'))
+    assert QMetaObject.invokeMethod(item('deviceTabButton'), 'pressed')
+    app.processEvents()
+    click('selectRemoteButton')
 if profile_b == 'chromecast-remote':
+    assert item('currentDeviceRow').property('stateText') == '已配对'
+    assert '蓝牙详细事件' not in item('remoteDeviceHelpNote').property('text')
     from ovb_rc003 import bridge_runtime_status as runtime_status
-    # Switching updates all three pages: the home status card, the keys photo,
-    # and the settings device rows.
-    assert label_b in app_vm.statusCard.property('title'), app_vm.statusCard.property('title')
-    keys_panel = item('keysPanel')
-    deadline = time.monotonic() + 3
-    while 'Chromecast-remote-photo.png' not in keys_panel.property('photoSourceUrl') and time.monotonic() < deadline:
-        app.processEvents()
-        window.grabWindow()
-    assert 'Chromecast-remote-photo.png' in keys_panel.property('photoSourceUrl'), keys_panel.property('photoSourceUrl')
-    assert choice_rows() == [(A, selection.label(A), True, False),
-                             (B, label_b, True, True)], choice_rows()
-    # Bridge runtime churn never changes which device is selected, and the
-    # receiver degradation is surfaced through the connection card detail
-    # (controller._describe_runtime_status), not the retired DevicePage helpers.
     controller._set_bridge_running(True)
-    def publish(raw_input_state, hid_tap_state='unknown',
-                state=runtime_status.BridgeConnectionState.CONNECTING):
-        # Feed the service's own status file and apply it exactly the way the
-        # running app does (read_status -> _sync_bridge_connection_status).
-        runtime_status.publish_status(controller._config_root, state,
-                                      raw_input_state=raw_input_state, hid_tap_state=hid_tap_state)
-        controller._sync_bridge_connection_status(True)
-        settle(2)
-    publish('starting')
-    assert controller.activeRemoteKey == B
-    assert device_vm.connectionCard.property('detail') == controller.launchStatusText
-    publish('chromecast_peer_identity_failed', state=runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE)
-    assert controller.activeRemoteKey == B
-    publish('chromecast_input_payload_unavailable', state=runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE)
-    assert controller.activeRemoteKey == B
-    publish('chromecast_recovering', hid_tap_state='starting')
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.CONNECTING, os.getpid(), time.time(), raw_input_state='starting'))
+    app.processEvents()
+    assert item('currentDeviceRow').property('stateText') == '已配对'
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE, os.getpid(), time.time(),
+        raw_input_state='chromecast_peer_identity_failed'))
+    app.processEvents()
+    assert item('currentDeviceRow').property('stateText') == '已配对'
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE, os.getpid(), time.time(),
+        raw_input_state='chromecast_input_payload_unavailable'))
+    app.processEvents()
+    page = item('deviceScroll').parent()
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.CONNECTING, os.getpid(), time.time(),
+        raw_input_state='chromecast_recovering', hid_tap_state='starting'))
+    app.processEvents()
+    assert page.buttonReceiverStateCode() == 'checking'
     assert not controller.buttonReceiverUsable
-    detail = device_vm.connectionCard.property('detail')
-    assert detail == controller.launchStatusText and detail, detail
-    assert '正在恢复' in detail, detail
-    publish('chromecast_capture_lost', hid_tap_state='failed', state=runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE)
-    detail = device_vm.connectionCard.property('detail')
-    assert '接收数据有丢失' in detail, detail
-    publish('chromecast_input_payload_unavailable', state=runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE)
-    detail = device_vm.connectionCard.property('detail')
-    assert '缺少按键内容' in detail, detail
-    publish('chromecast_sensitive_logging_enable_failed', state=runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE)
-    detail = device_vm.connectionCard.property('detail')
-    assert '蓝牙详细事件开启失败' in detail, detail
+    assert not page.bridgeNeedsRestartAction()
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE, os.getpid(), time.time(),
+        raw_input_state='chromecast_capture_lost', hid_tap_state='failed'))
+    app.processEvents()
+    assert page.buttonReceiverStateCode() == 'error'
+    assert page.bridgeNeedsRestartAction()
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE, os.getpid(), time.time(),
+        raw_input_state='chromecast_input_payload_unavailable'))
+    app.processEvents()
+    assert item('buttonReceiverRow').property('stateText') == '按键数据不完整'
+    assert item('buttonReceiverRow').property('descriptionText') == 'Windows 没有提供完整按键数据；可尝试重启电脑一次，仍失败请导出日志'
+    assert item('buttonReceiverRow').property('descriptionNeverElide')
+    assert page.buttonReceiverStateCode() == 'input_incomplete'
+    assert not page.bridgeNeedsRestartAction()
+    controller._set_bridge_input_states(runtime_status.BridgeRuntimeStatus(
+        3, runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE, os.getpid(), time.time(),
+        raw_input_state='chromecast_sensitive_logging_enable_failed'))
+    app.processEvents()
+    assert item('buttonReceiverRow').property('stateText') == '启用未完成'
+    assert not page.bridgeNeedsRestartAction()
+    assert page.bridgeStateText() == '请先完成启用'
     controller._set_bridge_running(False)
-    controller._sync_bridge_connection_status(False)
+    controller._set_bridge_input_states(None)
+    # The actual pages are lazy-loaded; instantiate their production loaders.
+    item('buttonsPageLoader').setProperty('active', True)
+    item('voicePageLoader').setProperty('active', True)
+    app.processEvents()
     if hotkey_scenario:
-        assert voice_vm.hotkeyLabel == controller.formatHotkeyText('rshift+i'), voice_vm.hotkeyLabel
+        assert item('holdVoiceHotkeyField').property('text') == controller.formatHotkeyText('rshift+i')
+    assert item('rc003DeviceButton').property('text') == '小米遥控器2 Pro'
+    assert item('futureDeviceButton').property('text') == '谷歌 Chromecast 遥控器'
+    assert not item('rc003DeviceButton').property('highlighted')
+    assert item('futureDeviceButton').property('highlighted')
+    assert '谷歌 Chromecast 遥控器' in item('audioPrerequisiteSectionTitle').property('text')
     assert controller.remoteRecordingModeIndex == 0
     assert controller.remoteRecordingLimitIndex == 1
-    assert voice_vm.recordingMode == '按住说话'
-    assert voice_vm.recordingLimitSeconds == 120
+    assert item('remoteRecordingModeCombo').property('count') == 2
     controller.setRemoteRecordingPreferences(1, 1)
-    settle()
+    app.processEvents()
     assert controller.remoteRecordingModeText == '开关型'
-    assert voice_vm.recordingMode == '按一次开·再按一次关'
+    assert item('remoteRecordingModeCombo').property('currentIndex') == 1
     stored_voice = m.config.load_config(m.config.config_path(controller._config_root))
     assert stored_voice['remote_recording_mode'] == 'toggle'
     assert stored_voice['remote_recording_limit_seconds'] == 120
     controller.setRemoteRecordingPreferences(0, 1)
-    settle()
-    assert voice_vm.recordingMode == '按住说话'
+    app.processEvents()
     assert controller.activeRemoteReady
     assert model.rowCount() == 15
     assert 'Chromecast-remote-photo.png' in controller.photoSource
-    nav('mappingTabButton')
-    if os.environ.get('REMOTE_SELECTION_SCREENSHOT_DIR'):
-        assert window.grabWindow().save(str(Path(os.environ['REMOTE_SELECTION_SCREENSHOT_DIR']) / 'mapping-before-assert.png'))
-    photo = item('photoImage')
-    deadline = time.monotonic() + 3
-    while photo.property('paintedWidth') <= 0 and time.monotonic() < deadline:
+    click('closeRemoteDialogButton')
+    assert QMetaObject.invokeMethod(item('mappingTabButton'), 'pressed')
+    for _ in range(12):
         app.processEvents()
         window.grabWindow()
-    assert photo.property('paintedWidth') > 0
-    assert item('editMapping_mic').property('voiceAction')
-    assert item('mappingVoicePausedText_mic').property('text') == '语音模式下暂停'
+    if os.environ.get('REMOTE_SELECTION_SCREENSHOT_DIR'):
+        assert window.grabWindow().save(str(Path(os.environ['REMOTE_SELECTION_SCREENSHOT_DIR']) / 'mapping-before-assert.png'))
+    assert not item('editMapping_mic').property('enabled')
     # Ordinary connectors pass behind the photo; only the selected connector
     # overlays it. The narrower frame preserves the center-column gutter.
+    photo = item('photoImage')
     sidebar = item('photoSidebar')
     assert photo.property('height') == 250
     assert sidebar.property('width') - photo.property('paintedWidth') >= 30
@@ -1376,7 +1363,7 @@ if profile_b == 'chromecast-remote':
                 window.grabWindow()
             assert window.grabWindow().save(str(Path(os.environ['REMOTE_SELECTION_SCREENSHOT_DIR']) / ('connector-' + button + '.png')))
     board = item('mappingList')
-    engine.globalObject().setProperty('probePage', engine.newQObject(item('keysPanel')))
+    engine.globalObject().setProperty('probePage', engine.newQObject(item('buttonsPageLoader').property('item')))
     engine.globalObject().setProperty('probeCanvas', engine.newQObject(item('mappingLines')))
     image_left = photo.mapToItem(item('mappingLines'), QPointF(
         (photo.property('width') - photo.property('paintedWidth')) / 2, 0)).x()
@@ -1384,7 +1371,7 @@ if profile_b == 'chromecast-remote':
     for button in ('up', 'left', 'down', 'back', 'home', 'youtube', 'power',
                    'right', 'ok', 'volume_up', 'volume_down', 'mic', 'volume_mute', 'netflix', 'input_source'):
         engine.globalObject().setProperty('probeCard', engine.newQObject(item('editMapping_' + button)))
-        engine.globalObject().setProperty('probeHotspot', engine.newQObject(item('photoHotspotMarker_' + button).parentItem()))
+        engine.globalObject().setProperty('probeHotspot', engine.newQObject(item('photoHotspot_' + button)))
         route_value = engine.evaluate('probePage.connectorRoute(probeCard, probeHotspot, probeCanvas)')
         assert not route_value.isError(), route_value.toString()
         route = route_value.toVariant()
@@ -1428,13 +1415,11 @@ if profile_b == 'chromecast-remote':
     click('editMapping_input_source')
     editor = item('actionEditorDialog')
     assert editor.property('visible')
-    fields = find_all(editor, lambda node: node.metaObject().indexOfProperty('placeholderText') >= 0
-                      and node.metaObject().indexOfProperty('text') >= 0)
-    assert len(fields) == 12, [class_name(node) for node in fields]
-    fields[0].setProperty('text', 'ctrl+f9')
-    fields[1].setProperty('text', '我的输入源操作')
-    settle()
+    editor.setProperty('primaryText', 'ctrl+f9')
+    editor.setProperty('primaryNote', '我的输入源操作')
+    app.processEvents()
     click('actionEditorSaveButton')
+    from PySide6.QtTest import QTest
     for _ in range(100):
         app.processEvents()
         if not controller.mappingDirty:
@@ -1444,25 +1429,50 @@ if profile_b == 'chromecast-remote':
     stored = m.config.load_key_bindings(m.config.key_bindings_path(controller._config_root))
     assert stored['bindings']['input_source']['keys'] == ['ctrl', 'f9']
     assert stored['display_notes']['input_source']['single_click'] == '我的输入源操作'
+    assert QMetaObject.invokeMethod(item('deviceTabButton'), 'pressed')
+    app.processEvents()
+    click('selectRemoteButton')
     if os.environ.get('REMOTE_SELECTION_SCREENSHOT_DIR'):
-        for tab, filename in [('homeTabButton', 'home'), ('mappingTabButton', 'buttons'), ('settingsTabButton', 'settings')]:
-            nav(tab)
+        click('closeRemoteDialogButton')
+        for tab, filename in [('deviceTabButton', 'device'), ('mappingTabButton', 'buttons'), ('voiceTabButton', 'voice')]:
+            assert QMetaObject.invokeMethod(item(tab), 'pressed')
+            for _ in range(12):
+                app.processEvents()
+                window.grabWindow()
             assert window.grabWindow().save(str(Path(os.environ['REMOTE_SELECTION_SCREENSHOT_DIR']) / (filename + '.png')))
+            if filename == 'voice':
+                controller.setRemoteRecordingPreferences(1, 1)
+                engine.globalObject().setProperty('probeVoiceScroll', engine.newQObject(item('voiceScroll')))
+                result = engine.evaluate('probeVoiceScroll.contentItem.contentY = Math.max(0, probeVoiceScroll.contentHeight - probeVoiceScroll.height)')
+                assert not result.isError(), result.toString()
+                for _ in range(12):
+                    app.processEvents()
+                    window.grabWindow()
+                assert window.grabWindow().save(str(Path(os.environ['REMOTE_SELECTION_SCREENSHOT_DIR']) / 'voice-toggle.png'))
+                controller.setRemoteRecordingPreferences(0, 1)
+        assert QMetaObject.invokeMethod(item('deviceTabButton'), 'pressed')
+        app.processEvents()
+        click('selectRemoteButton')
 if os.environ.get('REMOTE_SELECTION_SCREENSHOT'):
     assert window.grabWindow().save(os.environ['REMOTE_SELECTION_SCREENSHOT'])
-nav('settingsTabButton')
-settle()
-# A device scan refresh only updates the cache; it never switches the choice.
-with mock.patch.object(controller, '_start_background_task'):
-    click('settingsRefreshChecksButton')
-assert controller.remoteDevicesRefreshing
-controller._on_remote_devices_ready((paired_rows, ''))
-settle()
+choose(A)
 assert controller.activeRemoteKey == B
-assert choice_rows() == [(A, selection.label(A), True, False),
-                         (B, label_b, True, True)], choice_rows()
-rows = inline_rows()
-assert all(row.property('height') == 42 for row in rows), [row.property('height') for row in rows]
+with mock.patch.object(controller, '_start_background_task'):
+    click('refreshRemotesButton')
+assert controller.remoteDevicesRefreshing
+assert item('remoteDeviceDialog').property('dismissalEnabled')
+click('closeRemoteDialogButton')
+# A scan finishing after cancellation may refresh the cache, never the choice.
+controller._on_remote_devices_ready((paired_rows, ''))
+app.processEvents()
+assert controller.activeRemoteKey == B
+for _ in range(50):
+    app.processEvents()
+    if not item('remoteDeviceDialog').property('visible'):
+        break
+    QTest.qWait(10)
+assert not item('remoteDeviceDialog').property('visible')
+assert item('currentDeviceRow').property('height') == 42
 controller.shutdownBackgroundTasks()
 m._shutdown_diagnostics_workers()
 assert not warnings, warnings

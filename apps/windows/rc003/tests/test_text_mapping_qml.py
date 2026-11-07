@@ -13,7 +13,6 @@ from pathlib import Path
 from PySide6.QtCore import QMetaObject, QUrl, QPointF, Qt
 from PySide6.QtGui import QFontDatabase, QPalette, QColor
 from PySide6.QtTest import QTest
-from PySide6.QtQml import QQmlExpression, qmlContext
 from ovb_rc003 import qt_settings_app as m, config, key_mapping, mapping_presets
 from tests.test_qt_settings_app import SettingsControllerTests
 classes = m._load_qt_classes()
@@ -38,8 +37,6 @@ try:
     diagnostics = classes['DiagnosticsController'](controller, controller._config_root, auto_refresh=False)
     for name, instance in [('SettingsController', controller), ('ButtonMappingModel', model), ('DiagnosticsController', diagnostics)]:
         classes['qmlRegisterSingletonInstance'](classes[name], 'OvbRc003Settings', 1, 0, name, instance)
-    from ovb_rc003.presentation import registry
-    _viewmodels = registry.register(controller=controller, mapping_model=model, diagnostics=diagnostics)
     engine = classes['QQmlApplicationEngine']()
     warnings = []
     engine.warnings.connect(lambda items: warnings.extend(item.toString() for item in items))
@@ -50,12 +47,8 @@ try:
     window.setHeight(480)
     def tick():
         app.processEvents()
-        QTest.qWait(250)  # Fluent popup transitions finish before the next click.
+        QTest.qWait(220)
         app.processEvents()
-    def settle():
-        for _ in range(16):
-            app.processEvents()
-            QTest.qWait(50)
     def find(name):
         def walk(root):
             if root.objectName() == name: return root
@@ -71,111 +64,80 @@ try:
     def click(name):
         item = find(name)
         assert item.property('visible') and item.property('enabled'), name
-        point = item.mapToScene(QPointF(item.width()/2, item.height()/2)).toPoint()
+        point = item.mapToScene(QPointF(item.width()/2, item.height()/2))
         assert 0 <= point.x() <= window.width() and 0 <= point.y() <= window.height(), (name, point)
-        QTest.mousePress(window, Qt.LeftButton, Qt.NoModifier, point)
-        QTest.qWait(40)
-        QTest.mouseRelease(window, Qt.LeftButton, Qt.NoModifier, point)
+        QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point.toPoint())
         tick()
-    dialog = find('actionEditorDialog')
-    def qml(expression):
-        expr = QQmlExpression(qmlContext(dialog), dialog, expression)
-        value = expr.evaluate()
-        assert not expr.hasError(), expr.error().toString()
-        while isinstance(value, tuple):
-            value = value[0]
-        return value
-    # The action editor's payload fields are QML ids without objectNames, so
-    # resolve them through the dialog's creation context (same ids commitEditor
-    # itself uses).
-    def field(gesture, name):
-        return qml('editor%s%sField' % (gesture, name))
-    def set_field(gesture, name, text):
-        qml('editor%s%sField.text = %s' % (gesture, name, json.dumps(text, ensure_ascii=False)))
-    # The retired editor switched the action kind through its mode combo and
-    # saved the payload atomically; the new seam (MappingViewModel.setAction)
-    # validates a kind switch against the persisted bindings without the draft
-    # payload, so creating a brand-new text action in one session is rejected
-    # (reported gap). Establish the text mapping the same way the retired suite
-    # set up its CRLF fixture - through the registered model - and protect the
-    # editor round-trips on top of it.
-    row = model.indexOfButton('ok')
-    model.setActionTextAt(row, '输入文字')
-    model.setSecondaryActionTextAt(row, 'double_click', '输入文字')
-    model.setSecondaryActionTextAt(row, 'long_press', '输入文字')
-    model.setTextContentAt(row, 'single_click', '初始单击')
-    model.setTextContentAt(row, 'double_click', '初始双击')
-    model.setTextContentAt(row, 'long_press', '初始长按')
-    assert controller._save_mapping()
-    settle()
-    click('mappingTabButton')
+    find('tabBar').setProperty('currentIndex', 1)
     tick()
     click('editMapping_ok')
-    assert dialog.property('visible')
-    # Reopen round-trip: the editor shows the persisted text mapping verbatim.
-    assert field('Single', '').property('text') == '输入文字'
-    assert field('Single', 'Content').property('text') == '初始单击'
-    assert field('Double', 'Content').property('text') == '初始双击'
-    assert field('Long', 'Content').property('text') == '初始长按'
-    # Empty required payload stays a blocking "填写" validation error.
-    set_field('Single', 'Content', '')
+    dialog = find('actionEditorDialog')
+    combo = find('actionEditorPrimaryCombo')
+    # Select the actual dropdown option; do not simulate a text body as a command.
+    options = controller.primaryActionOptionsFor('ok')
+    arrow = combo.mapToScene(QPointF(combo.width() - 8, combo.height()/2))
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, arrow.toPoint())
+    tick()
+    QTest.keyClick(window, Qt.Key_Home)
+    for _ in range(options.index('输入文字')):
+        QTest.keyClick(window, Qt.Key_Down)
+    QTest.keyClick(window, Qt.Key_Return)
+    tick()
+    assert find('actionEditorPrimaryContent').property('visible')
+    assert not find('actionEditorPrimaryRecordButton').property('visible')
     click('actionEditorSaveButton')
     assert dialog.property('visible')
     assert '填写' in find('actionEditorValidationError').property('text')
     text = ' 你好😀\nCtrl+C\nEnter\nquicker:runaction:literal\t '
-    set_field('Single', 'Content', text)
+    find('actionEditorPrimaryContentField').setProperty('text', text)
+    tick()
     click('actionEditorSaveButton')
     assert not dialog.property('visible')
-    settle()
     assert controller._bindings['bindings']['ok']['text'] == text
-    # All three gestures can contain text without pushing Save out of the window.
+    imported_text = text.replace('\n', '\r\n')
+    model.setTextContentAt(model.index_of('ok'), 'single_click', imported_text)
+    assert controller._save_mapping()
     click('editMapping_ok')
-    set_field('Double', 'Content', text + 'Double')
-    set_field('Long', 'Content', text + 'Long')
+    assert find('actionEditorPrimaryContentField').property('text') == text
+    assert not dialog.property('draftDirty'), 'CRLF rendering must not count as an edit'
+    # All three gestures can contain text without pushing Save out of the window.
+    for name in ('Double', 'Long'):
+        find('actionEditor' + name + 'Combo').setProperty('editText', '输入文字')
+        find('actionEditor' + name + 'ContentField').setProperty('text', text + name)
     tick()
     assert dialog.property('height') <= window.height()
     screenshot = os.environ.get('TEXT_TEST_SCREENSHOT_DIR')
     if screenshot:
         window.grabWindow().save(str(Path(screenshot) / (profile + '-three-text.png')))
     click('actionEditorSaveButton')
-    assert not dialog.property('visible')
-    settle()
-    assert controller._bindings['bindings']['ok']['text'] == text
+    assert controller._bindings['bindings']['ok']['text'] == imported_text
     for name, trigger in (('Double', 'double_click'), ('Long', 'long_press')):
         assert controller._bindings['secondary_bindings']['ok'][trigger]['text'] == text + name
-    # Editing only the body must persist on completion.
     click('editMapping_ok')
-    set_field('Single', 'Content', '第二段')
+    # Editing only the body must make a dirty draft and persist on completion.
+    find('actionEditorPrimaryContentField').setProperty('text', '第二段')
+    assert dialog.property('draftDirty')
     click('actionEditorSaveButton')
-    assert not dialog.property('visible')
-    settle()
     assert controller._bindings['bindings']['ok']['text'] == '第二段'
     click('editMapping_ok')
-    set_field('Single', 'Content', '不保存')
+    find('actionEditorPrimaryContentField').setProperty('text', '不保存')
     click('actionEditorCancelButton')
-    settle()
-    assert controller._bindings['bindings']['ok']['text'] == '第二段'
     click('editMapping_ok')
-    assert field('Single', 'Content').property('text') == '第二段'
-    click('actionEditorCancelButton')
-    # An imported CRLF payload renders identically to its LF original and
-    # viewing it must never rewrite the stored bytes.
-    imported_text = text.replace('\n', '\r\n')
-    model.setTextContentAt(model.index_of('ok'), 'single_click', imported_text)
-    assert controller._save_mapping()
-    settle()
-    click('editMapping_ok')
-    assert field('Single', 'Content').property('text') == text
-    click('actionEditorCancelButton')
-    settle()
-    assert controller._bindings['bindings']['ok']['text'] == imported_text
-    # Switching the action to a chord replaces the text payload wholesale.
-    click('editMapping_ok')
-    set_field('Single', '', 'Ctrl+C')
+    assert find('actionEditorPrimaryContentField').property('text') == '第二段'
+    # Switching back makes manual shortcut entry available; it is still a chord.
+    arrow = combo.mapToScene(QPointF(combo.width() - 8, combo.height()/2))
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, arrow.toPoint())
+    tick()
+    QTest.keyClick(window, Qt.Key_Home)
+    QTest.keyClick(window, Qt.Key_Return)
+    tick()
+    assert combo.property('editable')
+    combo.setProperty('editText', 'Ctrl+C')
+    tick()
+    assert find('actionEditorPrimaryRecordButton').property('visible')
+    assert not find('actionEditorPrimaryContent').property('visible')
     click('actionEditorSaveButton')
-    assert not dialog.property('visible')
-    settle()
-    assert controller._bindings['bindings']['ok'] == {'kind': 'key_combo', 'keys': ['ctrl', 'c']}
+    assert controller._bindings['bindings']['ok'] == {'kind':'key_combo', 'keys':['ctrl','c']}
     assert not warnings, warnings
     print(json.dumps({'profile': profile, 'warnings': warnings}))
     window.hide()

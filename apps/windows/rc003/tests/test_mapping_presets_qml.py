@@ -1,4 +1,4 @@
-"""Real panel flow in disposable Qt processes; no native remote input."""
+"""Real modal-panel flow in disposable Qt processes; no native remote input."""
 import json
 import os
 from pathlib import Path
@@ -15,7 +15,6 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QMetaObject, QUrl, QPointF, Qt
 from PySide6.QtGui import QPalette, QColor, QFontDatabase
 from PySide6.QtTest import QTest
-from PySide6.QtQml import QQmlExpression, qmlContext
 from ovb_rc003 import qt_settings_app as m, config, mapping_presets
 from tests.test_qt_settings_app import SettingsControllerTests
 
@@ -43,8 +42,6 @@ try:
     diagnostics = classes['DiagnosticsController'](controller, controller._config_root, auto_refresh=False)
     for key, instance in [('SettingsController', controller), ('ButtonMappingModel', model), ('DiagnosticsController', diagnostics)]:
         classes['qmlRegisterSingletonInstance'](classes[key], 'OvbRc003Settings', 1, 0, key, instance)
-    from ovb_rc003.presentation import registry
-    _viewmodels = registry.register(controller=controller, mapping_model=model, diagnostics=diagnostics)
     engine = classes['QQmlApplicationEngine']()
     warnings = []
     engine.warnings.connect(lambda items: warnings.extend(item.toString() for item in items))
@@ -56,11 +53,7 @@ try:
     def tick():
         for _ in range(3):
             app.processEvents()
-        QTest.qWait(250)  # Fluent popup transitions finish before the next click.
-    def settle():
-        for _ in range(16):
-            app.processEvents()
-            QTest.qWait(50)
+        QTest.qWait(200)  # Fluent popup transitions finish before the next click.
     def find(name):
         def walk(root):
             if root.objectName() == name:
@@ -76,208 +69,117 @@ try:
         obj = walk(window)
         assert obj is not None, name
         return obj
-    def click(name):
-        item = find(name)
-        assert item.property('visible') and item.property('enabled'), name
-        point = item.mapToScene(QPointF(item.width() / 2, item.height() / 2)).toPoint()
-        assert 0 <= point.x() <= window.width() and 0 <= point.y() <= window.height(), (name, point)
-        QTest.mousePress(window, Qt.LeftButton, Qt.NoModifier, point)
-        QTest.qWait(40)
-        QTest.mouseRelease(window, Qt.LeftButton, Qt.NoModifier, point)
+    def invoke(name, method):
+        assert QMetaObject.invokeMethod(find(name), method), (name, method)
         tick()
-    def walk_items(root):
-        children = list(root.children())
-        if hasattr(root, 'childItems'):
-            children.extend(child for child in root.childItems() if child not in children)
-        for child in children:
-            yield child
-            yield from walk_items(child)
-    def qml_of(dialog, expression):
-        expr = QQmlExpression(qmlContext(dialog), dialog, expression)
-        value = expr.evaluate()
-        assert not expr.hasError(), expr.error().toString()
-        while isinstance(value, tuple):
-            value = value[0]
-        return value
-    # The action editor's payload fields are QML ids without objectNames, so
-    # resolve them through the dialog's creation context (same ids commitEditor
-    # itself uses).
-    editor = find('actionEditorDialog')
-    def set_editor_field(gesture, name, text):
-        qml_of(editor, 'editor%s%sField.text = %s' % (gesture, name, json.dumps(text, ensure_ascii=False)))
-    # Seed the working state through the real editor: a long-press mouse hold.
-    click('mappingTabButton')
+    def wait_for(predicate):
+        deadline = time.monotonic() + 3
+        while not predicate() and time.monotonic() < deadline:
+            QTest.qWait(20)
+            app.processEvents()
+        assert predicate(), 'popup transition did not finish'
+    def click(name):
+        button = find(name)
+        assert button.property('enabled'), name
+        point = button.mapToScene(QPointF(button.width() / 2, button.height() / 2))
+        assert 0 <= point.x() <= window.width() and 0 <= point.y() <= window.height(), (name, point)
+        QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point.toPoint())
+        tick()
+    find('tabBar').setProperty('currentIndex', 1)
     tick()
     click('editMapping_ok')
-    assert editor.property('visible')
-    set_editor_field('Long', '', '鼠标左键长按')
+    assert find('actionEditorDialog').property('visible')
+    find('actionEditorLongCombo').setProperty('editText', '鼠标左键长按')
     click('actionEditorSaveButton')
-    assert not editor.property('visible')
-    settle()
     assert controller._bindings['secondary_bindings']['ok']['long_press']['kind'] == 'mouse_left_hold'
-    # The preset management row moved from the retired MappingPresetsDialog to
-    # the settings page's 按键 section.
-    click('settingsTabButton')
-    tick()
-    flick = None
-    for obj in walk_items(find('settingsPanel')):
-        if 'Flickable' in obj.metaObject().className():
-            flick = obj
-            break
-    assert flick is not None
-    def ensure_visible(item):
-        content = flick.property('contentItem')
-        pos = item.mapToItem(content, QPointF(0, 0))
-        flick.setProperty('contentY', max(0, min(pos.y() - 40,
-            flick.property('contentHeight') - flick.property('height'))))
-        tick()
-    def click_in(name):
-        ensure_visible(find(name))
-        click(name)
-    click('settingsMappingSection_foldToggle')
-    tick()
-    # The retired MappingPresetsDialog refreshed the preset list on open through
-    # this same controller entry point; the new panel exposes no load trigger of
-    # its own (reported gap), so the probe performs the load step explicitly.
-    loaded = controller.mappingPresetAction('refresh', '', '')
-    assert loaded['ok'] and loaded['message'] == '', loaded
-    tick()
-    combo = find('settingsPresetCombo')
-    ensure_visible(combo)
-    assert combo.property('count') == 1
-    assert combo.property('currentIndex') == combo.property('effectiveIndex') == 0
-    assert '自动保存' in combo.property('displayText')
-    assert find('settingsApplyPresetButton').property('text') == '应用'
-    assert not find('settingsRenamePresetButton').property('enabled')
-    assert not find('settingsSavePresetButton').property('enabled')
-    assert find('settingsPanel').property('feedbackText') == ''
+    click('manageMappingPresetsButton')
+    dialog = find('mappingPresetsDialog')
+    assert dialog.property('visible')
+    assert not find('deleteMappingPresetButton').property('enabled')
+    assert not find('renameMappingPresetButton').property('enabled')
     assert len(controller.mappingPresets) == 1
     assert controller.mappingPresets[0]['automatic'] and controller.mappingPresets[0]['applied']
-    # All management actions form one row; every button stays within the section.
-    buttons = [find('settings' + name + 'PresetButton')
-               for name in ('Apply', 'Rename', 'Export', 'Delete', 'Import')]
+    combo = find('mappingPresetCombo')
+    assert combo.property('currentIndex') == combo.property('effectiveIndex') == 0
+    assert '自动保存' in combo.property('displayText')
+    assert find('applyMappingPresetButton').property('text') == '应用配置'
+    # All management actions form one row; every button stays within the dialog.
+    buttons = [find(name + 'MappingPresetButton') for name in ('copy', 'rename', 'delete', 'export', 'import')]
     positions = [button.mapToScene(QPointF(0, 0)) for button in buttons]
     assert max(point.y() for point in positions) - min(point.y() for point in positions) < 1
-    section = find('settingsMappingSection')
-    section_origin = section.mapToScene(QPointF(0, 0))
     for button, point in zip(buttons, positions):
-        assert point.x() >= section_origin.x()
-        assert point.x() + button.width() <= section_origin.x() + section.width()
+        assert point.x() >= dialog.property('x')
+        assert point.x() + button.width() <= dialog.property('x') + dialog.property('width')
     screenshot_dir = os.environ.get('PRESET_TEST_SCREENSHOT_DIR')
     if screenshot_dir:
         window.grabWindow().save(str(Path(screenshot_dir) / (profile + '-initial.png')))
-    # Copying the automatic row into a named preset; empty input cannot even be
-    # submitted (the retired naming dialog rejected it after accept).
-    name_field = find('settingsPresetNameField')
-    name_field.setProperty('text', '')
-    assert not find('settingsSavePresetButton').property('enabled')
-    name_field.setProperty('text', '我的按键配置')
-    tick()
-    assert find('settingsSavePresetButton').property('enabled')
-    click_in('settingsSavePresetButton')
-    settle()
+    click('copyMappingPresetButton')
+    assert find('mappingPresetNameDialog').property('visible')
+    # Invalid input remains editable in the naming dialog.
+    field = find('mappingPresetNameField')
+    field.setProperty('text', '')
+    invoke('mappingPresetNameDialog', 'accept')
+    wait_for(lambda: find('mappingPresetNameDialog').property('opened'))
+    field.setProperty('text', '我的按键配置')
+    invoke('mappingPresetNameDialog', 'accept')
+    wait_for(lambda: not find('mappingPresetNameDialog').property('visible'))
     assert len(controller.mappingPresets) == 2
     first = controller.mappingPresets[1]['id']
-    assert controller.mappingPresets[1]['name'] == '我的按键配置'
-    assert combo.property('effectiveIndex') == 0
+    assert combo.property('currentIndex') == 1 and combo.property('effectiveIndex') == 0
+    click('copyMappingPresetButton')
+    assert find('mappingPresetNameDialog').property('visible')
     # Browsing another row cannot redirect the copy's source.
-    click('mappingTabButton')
-    tick()
-    click('editMapping_ok')
-    set_editor_field('Long', '', 'Ctrl+C')
-    click('actionEditorSaveButton')
-    assert not editor.property('visible')
-    settle()
-    assert controller._bindings['secondary_bindings']['ok']['long_press'] == {'kind': 'key_combo', 'keys': ['ctrl', 'c']}
-    click('settingsTabButton')
-    tick()
-    ensure_visible(combo)
-    combo.setProperty('currentIndex', 1)
-    name_field.setProperty('text', '副本二')
-    tick()
-    click_in('settingsSavePresetButton')
-    settle()
-    store = mapping_presets.PresetStore(controller._config_root)
-    assert len(controller.mappingPresets) == 3
-    second = controller.mappingPresets[2]['id']
+    dialog.setProperty('selectedId', mapping_presets.AUTO_ID)
+    invoke('mappingPresetNameDialog', 'accept')
+    second = dialog.property('selectedId')
     assert second != first
-    assert controller.mappingPresets[2]['name'] == '副本二'
-    assert store.get(second)['mapping'] == mapping_presets.snapshot(controller._bindings, profile)
-    assert store.get(second)['mapping'] != store.get(first)['mapping']
-    # Renaming is scoped to the row selected at click time; others are untouched.
-    combo.setProperty('currentIndex', 2)
-    name_field.setProperty('text', '副本改名')
-    tick()
-    assert find('settingsRenamePresetButton').property('enabled')
-    click_in('settingsRenamePresetButton')
-    settle()
+    # Changing the selection after opening the name dialog cannot redirect rename.
+    click('renameMappingPresetButton')
+    dialog.setProperty('selectedId', first)
+    field.setProperty('text', '副本改名')
+    invoke('mappingPresetNameDialog', 'accept')
+    store = mapping_presets.PresetStore(controller._config_root)
     assert store.get(second)['name'] == '副本改名'
     assert store.get(first)['name'] == '我的按键配置'
-    first_mapping = store.get(first)['mapping']
-    # Applying replaces the live bindings with the selected preset.
-    combo.setProperty('currentIndex', 1)
-    tick()
-    click_in('settingsApplyPresetButton')
-    settle()
-    assert '已应用' in find('settingsPanel').property('feedbackText')
-    assert mapping_presets.snapshot(controller._bindings, profile) == first_mapping
+    before = dict(controller._bindings)
+    click('applyMappingPresetButton')
+    assert find('mappingPresetConfirmDialog').property('visible')
+    invoke('mappingPresetConfirmDialog', 'reject')
+    assert controller._bindings == before
+    click('applyMappingPresetButton')
+    invoke('mappingPresetConfirmDialog', 'accept')
+    assert '已应用' in dialog.property('message'), dialog.property('message')
     applied_index = next(index for index, row in enumerate(controller.mappingPresets) if row['applied'])
     assert combo.property('effectiveIndex') == applied_index
     # Browsing an unapplied row must not move the check mark or bold type.
-    combo.setProperty('currentIndex', 2)
+    dialog.setProperty('selectedId', first)
     tick()
     assert combo.property('effectiveIndex') == applied_index
-    combo.setProperty('currentIndex', applied_index)
-    tick()
-    click('settingsPresetCombo')
-    for index in range(combo.property('count')):
-        option = find('settingsPresetCombo_option_' + str(index))
+    click('mappingPresetCombo')
+    for index in range(len(controller.mappingPresets)):
+        option = find('mappingPresetCombo_option_' + str(index))
         weight = option.property('contentItem').property('font').weight()
         assert int(weight) == (600 if index == applied_index else 400), (index, weight)
-        mark = find('settingsPresetCombo_effectiveMark_' + str(index))
-        assert bool(mark.property('visible')) == (index == applied_index)
     if screenshot_dir:
         window.grabWindow().save(str(Path(screenshot_dir) / (profile + '.png')))
     QTest.keyClick(window, Qt.Key_Escape)
     tick()
     if screenshot_dir:
         window.grabWindow().save(str(Path(screenshot_dir) / (profile + '-panel.png')))
-    # Deleting requires confirmation; rejecting keeps both the preset and the
-    # live bindings intact.
-    before_bindings = json.dumps(controller._bindings, sort_keys=True)
-    combo.setProperty('currentIndex', 2)
-    tick()
-    click_in('settingsDeletePresetButton')
-    delete_dialog = find('deletePresetDialog')
-    assert delete_dialog.property('visible')
-    QMetaObject.invokeMethod(delete_dialog, 'reject')
-    tick()
-    assert len(controller.mappingPresets) == 3
-    assert json.dumps(controller._bindings, sort_keys=True) == before_bindings
-    for identity in (second, first):
-        rows = controller.mappingPresets
-        combo.setProperty('currentIndex', next(index for index, row in enumerate(rows) if row['id'] == identity))
+    invoke('mappingPresetsDialog', 'reject')
+    click('manageMappingPresetsButton')
+    assert combo.property('currentIndex') == combo.property('effectiveIndex') == applied_index
+    # Both records can be removed; the applied values remain intact.
+    for identity in (first, second):
+        dialog.setProperty('selectedId', identity)
         tick()
-        click_in('settingsDeletePresetButton')
-        QMetaObject.invokeMethod(delete_dialog, 'accept')
-        settle()
-    # Both records are removed; the applied values remain intact.
+        click('deleteMappingPresetButton')
+        invoke('mappingPresetConfirmDialog', 'accept')
     assert len(controller.mappingPresets) == 1
     assert controller.mappingPresets[0]['automatic'] and controller.mappingPresets[0]['applied']
-    assert mapping_presets.snapshot(controller._bindings, profile) == first_mapping
-    # The automatic entry cannot be renamed or removed.
-    combo.setProperty('currentIndex', 0)
-    name_field.setProperty('text', '试图改名')
-    tick()
-    click_in('settingsRenamePresetButton')
-    settle()
-    assert controller.mappingPresets[0]['name'] == mapping_presets.AUTO_NAME
-    assert find('settingsPanel').property('feedbackText') == '自动保存项代表当前按键设置，不能重命名或删除。'
-    click_in('settingsDeletePresetButton')
-    QMetaObject.invokeMethod(delete_dialog, 'accept')
-    settle()
-    assert len(controller.mappingPresets) == 1
-    assert controller.mappingPresets[0]['automatic'] and controller.mappingPresets[0]['applied']
+    assert not find('deleteMappingPresetButton').property('enabled')
+    invoke('mappingPresetsDialog', 'reject')
+    assert not dialog.property('visible')
     # A legacy mapping that needs correction must not hide valid named copies.
     store = mapping_presets.PresetStore(controller._config_root)
     compatible = store.create('兼容验证副本', profile, mapping_presets.snapshot(controller._bindings, profile))
@@ -288,23 +190,17 @@ try:
     controller._load_bindings_into_model()
     controller._set_mapping_dirty(True)
     legacy_before = json.dumps(controller._bindings, sort_keys=True)
-    click('homeTabButton')
-    tick()
-    click('settingsTabButton')
-    tick()
-    ensure_visible(combo)
-    loaded = controller.mappingPresetAction('refresh', '', '')
-    assert loaded['ok'] and loaded['message'] == '', loaded
-    tick()
-    assert combo.property('count') == 2
+    click('manageMappingPresetsButton')
+    assert dialog.property('visible') and combo.property('count') == 2
     assert combo.property('currentIndex') == combo.property('effectiveIndex') == 0
-    assert [row['id'] for row in controller.mappingPresets] == [mapping_presets.AUTO_ID, compatible]
-    imported = _viewmodels.MappingViewModel.importPreset(QUrl.fromLocalFile(str(export)).toString())
+    assert dialog.property('message') == ''
+    imported = controller.mappingPresetAction('import', '', QUrl.fromLocalFile(str(export)).toString())
     assert imported['ok'], imported
-    settle()
-    assert combo.property('count') == 3
-    assert controller.mappingPresets[2]['id'] == imported['field']
+    dialog.setProperty('selectedId', imported['id'])
+    tick()
+    assert combo.property('count') == 3 and combo.property('currentIndex') == 2
     assert json.dumps(controller._bindings, sort_keys=True) == legacy_before
+    invoke('mappingPresetsDialog', 'reject')
     assert not warnings, warnings
     print(json.dumps({'profile': profile, 'warnings': warnings, 'width': 640, 'height': 480}))
     window.hide()

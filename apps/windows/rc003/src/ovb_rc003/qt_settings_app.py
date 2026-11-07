@@ -10248,17 +10248,6 @@ def run_settings_window(
             diagnostics_controller,
         )
 
-        # Presentation-layer wiring only (no business logic): register the
-        # UI-facing view-models under OvbRc003Presentation 1.0 so the QML
-        # views bind to presentation shapes instead of backend internals.
-        # See docs/UI-REDESIGN.md.
-        from .presentation import registry as _presentation_registry
-        presentation_viewmodels = _presentation_registry.register(
-            controller=controller,
-            mapping_model=model,
-            diagnostics=diagnostics_controller,
-        )
-
         engine = QQmlApplicationEngine()
         qml_dir = _qml_directory()
         engine.addImportPath(str(qml_dir))
@@ -10271,15 +10260,6 @@ def run_settings_window(
         root_window = root_objects[0]
         update_application_icon()
         window_chrome_windows.apply_settings_window_chrome(root_window)
-
-        # Launch-time backend work (starting the bridge service, the startup
-        # update check) is driven from here rather than from a QML completion
-        # handler: a QML binding error aborts its whole handler silently, so a
-        # view-driven call is not a reliable place to hang startup. The shell
-        # still calls the same idempotent slots, which keeps the layering
-        # honest without depending on it for correctness.
-        presentation_viewmodels.AppViewModel.onWindowReady()
-        presentation_viewmodels.AppViewModel.startupSettled()
 
         # The real QML window and full-exit signal are ready here. Publish the
         # capability before optional element navigation startup, whose bounded

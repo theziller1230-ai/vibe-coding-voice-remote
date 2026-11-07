@@ -189,7 +189,6 @@ class NativeRestoreEventTests(unittest.TestCase):
         # the event, production registration/polling, QML and cleanup are real.
         script = r'''
 import sys
-import time
 from PySide6.QtCore import QTimer
 from ovb_rc003 import qt_settings_app as m
 si = m.single_instance
@@ -203,14 +202,6 @@ si._real_set_window_property_value = publish
 original_connect = m._connect_application_exit
 def connect(app, controller):
     original_connect(app, controller)
-    def wait_visible(window, timeout=3.0):
-        # The duplicate-launch restore pump is AppViewModel.tick() at the
-        # view's 1s cadence (main.qml); allow up to three pump periods to
-        # land before declaring the restore dead.
-        deadline = time.monotonic() + timeout
-        while not window.isVisible() and time.monotonic() < deadline:
-            app.processEvents()
-            time.sleep(0.02)
     def check(stage):
         try:
             window = next(w for w in app.topLevelWindows() if w.title() == controller.applicationPresentationLabel)
@@ -219,21 +210,17 @@ def connect(app, controller):
                 assert not window.isVisible(), "window should be hidden"
                 assert si._real_signal_restore_event(hwnd, published[hwnd]), "event signal failed"
             elif stage == 1:
-                wait_visible(window)
                 assert window.isVisible(), "first restore failed"
                 window.close()
-                assert not window.isVisible(), "close should hide the window"
             else:
-                wait_visible(window)
                 assert window.isVisible(), "second restore failed"
                 controller.requestApplicationExit()
-                return
-            QTimer.singleShot(50, lambda stage=stage + 1: check(stage))
         except Exception as exc:
-            print(repr(exc), file=sys.__stderr__)
+            print(repr(exc), file=sys.stderr)
             app.exit(2)
-    QTimer.singleShot(50, lambda: check(0))
-    QTimer.singleShot(20000, lambda: app.exit(3))
+    for stage, delay in enumerate((50, 600, 850, 1400)):
+        QTimer.singleShot(delay, lambda stage=stage: check(stage))
+    QTimer.singleShot(5000, lambda: app.exit(3))
 m._connect_application_exit = connect
 result = m.run_settings_window(start_hidden=True)
 assert not si._settings_window_restore_events, "event leaked after shutdown"
